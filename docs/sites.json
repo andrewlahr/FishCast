@@ -1,0 +1,152 @@
+[
+  {
+    "stream": "Beaverhead",
+    "section": "FishAndGame",
+    "label": "Beaverhead — FishAndGame",
+    "file": "Beaverhead_FishAndGame.html"
+  },
+  {
+    "stream": "Beaverhead",
+    "section": "Hildreth",
+    "label": "Beaverhead — Hildreth",
+    "file": "Beaverhead_Hildreth.html"
+  },
+  {
+    "stream": "BigHole",
+    "section": "HogBack",
+    "label": "BigHole — HogBack",
+    "file": "BigHole_HogBack.html"
+  },
+  {
+    "stream": "BigHole",
+    "section": "Melrose",
+    "label": "BigHole — Melrose",
+    "file": "BigHole_Melrose.html"
+  },
+  {
+    "stream": "Bighorn",
+    "section": "Bighorn",
+    "label": "Bighorn — Bighorn",
+    "file": "Bighorn_Bighorn.html"
+  },
+  {
+    "stream": "Bighorn",
+    "section": "MallardsLanding",
+    "label": "Bighorn — MallardsLanding",
+    "file": "Bighorn_MallardsLanding.html"
+  },
+  {
+    "stream": "Bitterroot",
+    "section": "BellCrossing",
+    "label": "Bitterroot — BellCrossing",
+    "file": "Bitterroot_BellCrossing.html"
+  },
+  {
+    "stream": "Bitterroot",
+    "section": "Darby",
+    "label": "Bitterroot — Darby",
+    "file": "Bitterroot_Darby.html"
+  },
+  {
+    "stream": "Blackfoot",
+    "section": "Johnsrud",
+    "label": "Blackfoot — Johnsrud",
+    "file": "Blackfoot_Johnsrud.html"
+  },
+  {
+    "stream": "Blackfoot",
+    "section": "ScottyBrown",
+    "label": "Blackfoot — ScottyBrown",
+    "file": "Blackfoot_ScottyBrown.html"
+  },
+  {
+    "stream": "Boulder",
+    "section": "B2",
+    "label": "Boulder — B2",
+    "file": "Boulder_B2.html"
+  },
+  {
+    "stream": "Madison",
+    "section": "Norris",
+    "label": "Madison — Norris",
+    "file": "Madison_Norris.html"
+  },
+  {
+    "stream": "Madison",
+    "section": "PineButte",
+    "label": "Madison — PineButte",
+    "file": "Madison_PineButte.html"
+  },
+  {
+    "stream": "Madison",
+    "section": "Varney",
+    "label": "Madison — Varney",
+    "file": "Madison_Varney.html"
+  },
+  {
+    "stream": "Missouri",
+    "section": "Cascade",
+    "label": "Missouri — Cascade",
+    "file": "Missouri_Cascade.html"
+  },
+  {
+    "stream": "Missouri",
+    "section": "Craig",
+    "label": "Missouri — Craig",
+    "file": "Missouri_Craig.html"
+  },
+  {
+    "stream": "RockCreek",
+    "section": "FishAndGame",
+    "label": "RockCreek — FishAndGame",
+    "file": "RockCreek_FishAndGame.html"
+  },
+  {
+    "stream": "RockCreek",
+    "section": "HogBack",
+    "label": "RockCreek — HogBack",
+    "file": "RockCreek_HogBack.html"
+  },
+  {
+    "stream": "Ruby",
+    "section": "SilverSprings",
+    "label": "Ruby — SilverSprings",
+    "file": "Ruby_SilverSprings.html"
+  },
+  {
+    "stream": "Ruby",
+    "section": "Vigilante",
+    "label": "Ruby — Vigilante",
+    "file": "Ruby_Vigilante.html"
+  },
+  {
+    "stream": "Shields",
+    "section": "ConvictGrade",
+    "label": "Shields — ConvictGrade",
+    "file": "Shields_ConvictGrade.html"
+  },
+  {
+    "stream": "Shields",
+    "section": "Zimmerman",
+    "label": "Shields — Zimmerman",
+    "file": "Shields_Zimmerman.html"
+  },
+  {
+    "stream": "Smith",
+    "section": "EagleCreek",
+    "label": "Smith — EagleCreek",
+    "file": "Smith_EagleCreek.html"
+  },
+  {
+    "stream": "Yellowstone",
+    "section": "CorwinSprings",
+    "label": "Yellowstone — CorwinSprings",
+    "file": "Yellowstone_CorwinSprings.html"
+  },
+  {
+    "stream": "Yellowstone",
+    "section": "MillCreek",
+    "label": "Yellowstone — MillCreek",
+    "file": "Yellowstone_MillCreek.html"
+  }
+]

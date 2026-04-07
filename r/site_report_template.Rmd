@@ -1,0 +1,2139 @@
+---
+title: "`r paste(params$stream, 'River —', params$section, 'Section')`"
+subtitle: "Brown Trout IPM — Streamflow Effects on Population Dynamics"
+author: "Montana Fisheries Analysis"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: hide
+  word_document:
+    toc: true
+    toc_depth: 3
+params:
+  stream:       "BigHole"
+  section:      "Melrose"
+  data_dir:     "data/ModelFits/Brown Trout"      # single folder for CSVs + .rds model fits
+  show_flow:    true                               # overlay lagged flow on abundance/survival plots
+  min_inclusion_threshold: 0.10                    # cutoff used in appendix selection panels
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 5,
+  dpi = 150
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(here)
+library(paletteer)
+library(plotly)
+library(htmltools)
+```
+
+<!-- =========================================================================
+     SECTION 0 — LOAD LAG-SELECTION RESULTS & DETERMINE MODEL TYPE
+     ========================================================================= -->
+
+```{r lag-selection-load}
+SS        <- paste(params$stream, params$section, sep = ".")
+data_dir  <- here::here(params$data_dir)
+lag_dir   <- data_dir   # retained for backward compatibility with downstream chunks
+model_dir <- data_dir
+min_inclusion_threshold <- params$min_inclusion_threshold
+
+# ── Load lag-selection CSV ────────────────────────────────────────────────────
+csv_path <- file.path(data_dir, paste0(SS, "_RecLagInclusionProbQuad.csv"))
+if (!file.exists(csv_path))
+  stop("Lag-selection CSV not found:\n  ", csv_path)
+
+site_data <- read.csv(csv_path, stringsAsFactors = FALSE) %>%
+  mutate(
+    Stream.Section = SS,
+    Stream         = params$stream,
+    Section        = params$section,
+    RowModelType   = case_when(
+      !is.na(SummerLag) & !is.na(WinterLag) ~ "Global (Summer + Winter)",
+      !is.na(SummerLag) &  is.na(WinterLag) ~ "Summer Flow Only",
+       is.na(SummerLag) & !is.na(WinterLag) ~ "Winter Flow Only",
+      TRUE ~ "Unknown"
+    )
+  )
+
+has_global <- any(site_data$RowModelType == "Global (Summer + Winter)")
+has_summer <- any(site_data$RowModelType == "Summer Flow Only")
+has_winter <- any(site_data$RowModelType == "Winter Flow Only")
+
+pop_model_type <- case_when(
+  has_global              ~ "Global (Summer + Winter)",
+  has_summer & has_winter ~ "Summer + Winter (separate models)",
+  has_summer              ~ "Summer Flow Only",
+  has_winter              ~ "Winter Flow Only",
+  TRUE                    ~ "Unknown"
+)
+
+# ── Top lag + quad per sub-model ──────────────────────────────────────────────
+top_lags <- site_data %>%
+  group_by(RowModelType) %>%
+  distinct(RowModelType, SummerLag, WinterLag, AllInclusion) %>%
+  slice_max(AllInclusion, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  rename(TopSummerLag = SummerLag, TopWinterLag = WinterLag,
+         TopLagInclusion = AllInclusion)
+
+top_quad <- site_data %>%
+  inner_join(top_lags %>% select(RowModelType, TopSummerLag, TopWinterLag),
+             by = "RowModelType") %>%
+  filter(
+    (is.na(SummerLag) & is.na(TopSummerLag)) |
+      (!is.na(SummerLag) & SummerLag == TopSummerLag),
+    (is.na(WinterLag) & is.na(TopWinterLag)) |
+      (!is.na(WinterLag) & WinterLag == TopWinterLag)
+  ) %>%
+  group_by(RowModelType) %>%
+  slice_max(lagInclusion, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(top_lags, by = "RowModelType")
+
+# ── Lag label lookup (used by appendix selection panels) ──────────────────────
+lag_summary <- site_data %>%
+  distinct(RowModelType, SummerLag, WinterLag, AllInclusion) %>%
+  mutate(
+    LagLabel = case_when(
+      RowModelType == "Global (Summer + Winter)" ~
+        paste0("S", SummerLag, "/W", WinterLag),
+      RowModelType == "Summer Flow Only" ~
+        paste0("S", SummerLag),
+      RowModelType == "Winter Flow Only" ~
+        paste0("W", WinterLag),
+      TRUE ~ "?"
+    )
+  ) %>%
+  left_join(top_lags %>% select(RowModelType, TopSummerLag, TopWinterLag),
+            by = "RowModelType") %>%
+  mutate(
+    IsTop = (
+      (is.na(SummerLag) & is.na(TopSummerLag)) |
+        (!is.na(SummerLag) & SummerLag == TopSummerLag)
+    ) & (
+      (is.na(WinterLag) & is.na(TopWinterLag)) |
+        (!is.na(WinterLag) & WinterLag == TopWinterLag)
+    )
+  )
+
+# Sub-model labels used in site overview
+submodels <- sort(unique(site_data$RowModelType))
+```
+
+<!-- =========================================================================
+     SECTION 1 — LOAD MODEL FITS
+     Each sub-model type loads its corresponding .rds files.
+     All posterior sims are extracted from $BUGSoutput$sims.list.
+     ========================================================================= -->
+
+```{r load-model-fits}
+# ── Helper: safely load an rds ───────────────────────────────────────────────
+load_rds <- function(path) {
+  if (!file.exists(path)) {
+    warning("File not found: ", path)
+    return(NULL)
+  }
+  readRDS(path)
+}
+
+# ── Helper: pull sims.list from a jags.parallel / R2jags object ──────────────
+get_sims <- function(mod) {
+  if (is.null(mod)) return(NULL)
+  mod$BUGSoutput$sims.list
+}
+
+# ── Load flow model(s) ────────────────────────────────────────────────────────
+if (has_global) {
+  mod_flow    <- load_rds(file.path(model_dir,
+                    paste0(SS, "_IndicatorVarSel_TopMod_Feb26.rds")))
+  sims_flow   <- get_sims(mod_flow)
+  sims_summer <- sims_flow   # same object used for both summer & winter params
+  sims_winter <- sims_flow
+} else {
+  mod_summer  <- load_rds(file.path(model_dir,
+                    paste0(SS, "_IndicatorVarSel_TopModSummer_Feb26.rds")))
+  mod_winter  <- load_rds(file.path(model_dir,
+                    paste0(SS, "_IndicatorVarSel_TopModWinter_Feb26.rds")))
+  sims_summer <- get_sims(mod_summer)
+  sims_winter <- get_sims(mod_winter)
+  sims_flow   <- sims_summer   # use summer as the primary sims for shared params
+}
+
+# ── Load residual-variance model objects ─────────────────────────────────────
+if (has_global) {
+  resids_flow <- load_rds(file.path(model_dir,
+    paste0(SS, "_IndicatorVarSel_TopMod_resids.rds")))
+} else {
+  resids_summer <- load_rds(file.path(model_dir,
+    paste0(SS, "_IndicatorVarSel_topModSummer_resids.rds")))
+  resids_winter <- load_rds(file.path(model_dir,
+    paste0(SS, "_IndicatorVarSel_topModWinter_resids.rds")))
+  resids_flow <- list(summer = resids_summer, winter = resids_winter)
+}
+
+resids_null <- load_rds(file.path(model_dir,
+  paste0(SS, "_IndicatorVarSel_NullMod_resids.rds")))
+
+sims_null <- get_sims(resids_null)
+
+# ── Load site flow CSV first (needed to derive start_year) ──────────────────
+# Long format: Stream.Section | Year | Flow | Season ("Summer"/"Winter") | SurvLag
+flow_path <- file.path(lag_dir, paste0(SS, "_flow.csv"))
+flow_df <- if (file.exists(flow_path)) {
+  df <- read.csv(flow_path, stringsAsFactors = FALSE)
+  if ("Stream.Section" %in% names(df))
+    df <- df %>% filter(Stream.Section == SS)
+  df
+} else {
+  warning("Flow CSV not found: ", flow_path)
+  NULL
+}
+
+# ── Derive start_year dynamically from the flow CSV ───────────────────────────
+# Priority: (1) min year in site flow CSV, (2) min year in lag-selection CSV,
+# (3) hard-coded fallback of 1980.
+start_year <- if (!is.null(flow_df) && "Year" %in% names(flow_df)) {
+  as.integer(min(as.numeric(flow_df$Year), na.rm = TRUE))
+} else if (exists("site_data") && "Year" %in% names(site_data)) {
+  as.integer(min(as.numeric(site_data$Year), na.rm = TRUE))
+} else {
+  1980L
+}
+
+# ── Build year vector from model N2 time series length ───────────────────────
+get_years <- function(sims, start_yr) {
+  if (is.null(sims) || is.null(sims$N2)) return(NULL)
+  n_years <- ncol(sims$N2)
+  seq(start_yr, by = 1, length.out = n_years)
+}
+
+years <- get_years(sims_flow,   start_year) %||%
+         get_years(sims_summer, start_year) %||%
+         get_years(sims_winter, start_year)
+```
+
+<!-- =========================================================================
+     SECTION 2 — HELPER FUNCTIONS
+     ========================================================================= -->
+
+```{r helpers}
+# NULL-coalescing operator
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ── Posterior summary: median + 90% CrI from a vector ───────────────────────
+post_summary <- function(x, digits = 4) {
+  if (is.null(x) || all(is.na(x))) return(data.frame(Median = NA, Lo90 = NA, Hi90 = NA))
+  data.frame(
+    Median = round(median(x, na.rm = TRUE), digits),
+    Lo90   = round(quantile(x, 0.1,  na.rm = TRUE), digits),
+    Hi90   = round(quantile(x, 0.9,  na.rm = TRUE), digits)
+  )
+}
+
+# ── Time-series posterior summary ────────────────────────────────────────────
+ts_summary <- function(mat, yrs) {
+  if (is.null(mat) || is.null(yrs)) return(NULL)
+  tibble(
+    Year   = yrs,
+    Median = apply(mat, 2, median,   na.rm = TRUE),
+    Lo90   = apply(mat, 2, quantile, 0.10, na.rm = TRUE),
+    Hi90   = apply(mat, 2, quantile, 0.90, na.rm = TRUE)
+  )
+}
+
+# ── Credible-interval ribbon + median line ───────────────────────────────────
+ci_geom <- function(fill = "#2E86C1", alpha = 0.25, line_col = "#1A5276") {
+  list(
+    geom_ribbon(aes(ymin = Lo90, ymax = Hi90),
+                fill = fill, alpha = alpha, color = NA),
+    geom_line(color  = line_col, linewidth = 0.8),
+    geom_point(color = line_col, size = 1.5)
+  )
+}
+
+# ── Standard report theme ────────────────────────────────────────────────────
+theme_report <- function(base = 10) {
+  theme_bw(base_size = base) +
+    theme(panel.grid.minor = element_blank(),
+          strip.background = element_rect(fill = "#2C5F8A"),
+          strip.text       = element_text(color = "white", face = "bold"))
+}
+
+# ── Parameter table row: Median + 90% CrI ───────────────────────────────────
+fmt_row <- function(label, vec, digits = 3) {
+  s <- post_summary(vec, digits)
+  data.frame(
+    Parameter = label,
+    Median    = s$Median,
+    `90% CrI` = paste0("[", s$Lo90, ", ", s$Hi90, "]"),
+    check.names = FALSE
+  )
+}
+
+# ── Explained residual variance ──────────────────────────────────────────────
+expl_var <- function(sigma_flow, sigma_null) {
+  if (is.null(sigma_flow) || is.null(sigma_null)) return(NULL)
+  1 - (sigma_flow / sigma_null)
+}
+
+# ── Extract sigma from a resids object (handles global or summer/winter list)
+get_sigma <- function(obj, param) {
+  if (is.null(obj)) return(NULL)
+  if (is.list(obj) && !is.null(obj$BUGSoutput))
+    return(obj$BUGSoutput$sims.list[[param]])
+  if (is.list(obj) && any(c("summer", "winter") %in% names(obj))) {
+    s <- obj$summer$BUGSoutput$sims.list[[param]]
+    w <- obj$winter$BUGSoutput$sims.list[[param]]
+    return(c(s, w))
+  }
+  NULL
+}
+
+# ── Posterior direction: "positive", "negative", "weak or uncertain" ─────────
+param_direction <- function(vec, prob_thresh = 0.80) {
+  if (is.null(vec) || all(is.na(vec))) return("not estimated")
+  p_pos <- mean(vec > 0, na.rm = TRUE)
+  p_neg <- mean(vec < 0, na.rm = TRUE)
+  if      (p_pos >= prob_thresh) "positive"
+  else if (p_neg >= prob_thresh) "negative"
+  else                           "weak or uncertain"
+}
+
+# ── Human-readable lag phrase ────────────────────────────────────────────────
+lag_phrase <- function(lag_val) {
+  if (is.null(lag_val) || is.na(lag_val)) return("an unspecified lag")
+  if (lag_val == 0) return("the same year")
+  if (lag_val == 1) return("1 year prior")
+  paste0(lag_val, " years prior")
+}
+
+# ── Whether a quad term was selected (returns TRUE/FALSE/NA) ─────────────────
+quad_selected <- function(val) {
+  if (is.null(val) || is.na(val)) return(NA)
+  tolower(trimws(val)) == "yes"
+}
+```
+
+<!-- =========================================================================
+     SECTION 3 — PRE-COMPUTE NARRATIVE QUANTITIES
+     Derived inline values used in the interpretive write-up.
+     ========================================================================= -->
+
+```{r narrative-quantities}
+sims_primary <- sims_flow %||% sims_summer %||% sims_winter
+
+# ── Flow parameter directions ─────────────────────────────────────────────────
+dir_b1r  <- param_direction(sims_summer$b1r)
+dir_b12r <- param_direction(sims_summer$b12r)
+dir_b5r  <- param_direction(sims_winter$b5r)
+dir_b52r <- param_direction(sims_winter$b52r)
+dir_b1S  <- param_direction(sims_summer$b1S)
+dir_b12S <- param_direction(sims_summer$b12S)
+dir_b5S  <- param_direction(sims_winter$b5S)
+dir_b52S <- param_direction(sims_winter$b52S)
+dir_b6S  <- param_direction(sims_primary$b6S)
+
+# ── Selected top lags ────────────────────────────────────────────────────────
+get_top_lag <- function(model_type, col) {
+  top_lags %>% filter(RowModelType == model_type) %>% pull({{col}}) %>% first()
+}
+
+top_glob_sum_lag <- get_top_lag("Global (Summer + Winter)", TopSummerLag)
+top_glob_win_lag <- get_top_lag("Global (Summer + Winter)", TopWinterLag)
+top_sum_lag      <- get_top_lag("Summer Flow Only",         TopSummerLag)
+top_win_lag      <- get_top_lag("Winter Flow Only",         TopWinterLag)
+
+eff_sum_lag <- if (has_global) top_glob_sum_lag else top_sum_lag
+eff_win_lag <- if (has_global) top_glob_win_lag else top_win_lag
+
+# ── Selected quadratic terms ─────────────────────────────────────────────────
+get_top_quad_val <- function(model_type, col) {
+  top_quad %>% filter(RowModelType == model_type) %>% pull({{col}}) %>% first()
+}
+
+# Pull from whichever sub-model type exists
+sum_rec_quad  <- get_top_quad_val(
+  if (has_global) "Global (Summer + Winter)" else "Summer Flow Only", SummerRecQuad)
+win_rec_quad  <- get_top_quad_val(
+  if (has_global) "Global (Summer + Winter)" else "Winter Flow Only", WinterRecQuad)
+sum_surv_quad <- get_top_quad_val(
+  if (has_global) "Global (Summer + Winter)" else "Summer Flow Only", SummerSurvQuad)
+win_surv_quad <- get_top_quad_val(
+  if (has_global) "Global (Summer + Winter)" else "Winter Flow Only", WinterSurvQuad)
+
+# ── Explained variance medians (%) ───────────────────────────────────────────
+# sigmaR_null    <- get_sigma(resids_null,  "sigmaR")
+# sigmaSurv_null <- get_sigma(resids_null,  "sigmaSurv")
+# sigmaR_flow    <- get_sigma(resids_flow,  "sigmaR")
+# sigmaSurv_flow <- get_sigma(resids_flow,  "sigmaSurv")
+if (has_global) {
+  sigmaR_null    <- get_sigma(resids_null,  "sigmaR")
+sigmaSurv_null <- get_sigma(resids_null,  "sigmaSurv")
+sigmaR_flow    <- get_sigma(resids_flow,  "sigmaR")
+sigmaSurv_flow <- get_sigma(resids_flow,  "sigmaSurv")
+} else {
+ sigmaR_null    <- get_sigma(resids_null,  "sigmaR")
+sigmaSurv_null <- get_sigma(resids_null,  "sigmaSurv")
+sigmaR_flow    <- get_sigma(resids_summer,  "sigmaR")
+sigmaSurv_flow <- get_sigma(resids_summer,  "sigmaSurv")
+}
+
+ev_rec  <- expl_var(sigmaR_flow,    sigmaR_null)
+ev_surv <- expl_var(sigmaSurv_flow, sigmaSurv_null)
+
+ev_rec_med  <- if (!is.null(ev_rec))  round(median(ev_rec,  na.rm = TRUE) * 100, 1) else NA
+ev_surv_med <- if (!is.null(ev_surv)) round(median(ev_surv, na.rm = TRUE) * 100, 1) else NA
+
+# ── Long-term biomass trend ───────────────────────────────────────────────────
+biomass_trend_phrase <- tryCatch({
+  b_tot <- sims_primary$B2 + sims_primary$B3 + sims_primary$B4
+  med_b <- apply(b_tot, 2, median, na.rm = TRUE)
+  slope <- lm(med_b ~ years)$coefficients["years"]
+  if (slope > 0) paste0("an increasing trend (~", round(slope, 1), " g/yr)")
+  else           paste0("a declining trend (~",   round(abs(slope), 1), " g/yr)")
+}, error = function(e) "no clear long-term trend")
+```
+
+---
+
+# About This Project
+
+This report summarizes a Bayesian integrated population model (IPM) quantifying how streamflow and drought conditions influence brown trout population dynamics across Montana river sections. For each site, the model evaluates how seasonal (summer and winter) flows — at various time lags — affect recruitment and adult survival, then selects the best-supported flow structure via Bayesian indicator variable selection. Results below show the selected model, parameter estimates, fitted flow–response relationships, and the proportion of recruitment and survival variance explained by flow.
+
+---
+
+# Site Overview
+
+| | |
+|---|---|
+| **River** | `r params$stream` |
+| **Section** | `r params$section` |
+| **Model structure** | `r pop_model_type` |
+| **Sub-models present** | `r paste(submodels, collapse = ", ")` |
+| **Year range** | `r if (!is.null(years)) paste(min(years), "\u2013", max(years)) else "unknown"` |
+| **N lag combinations evaluated** | `r nrow(lag_summary)` |
+
+---
+
+# Model Selection Summary
+
+The table below shows the top-selected flow structure — that is, the combination of summer and winter flow lags (and quadratic vs. linear shape) with the highest posterior inclusion probability. Full model-selection details (lag inclusion probabilities, joint lag heatmap, quadratic-term panels, and the complete combinations table) are provided in the **Appendix**.
+
+```{r top-model-summary-table}
+top_quad %>%
+  transmute(
+    `Sub-model`        = RowModelType,
+    `Top Summer Lag`   = ifelse(is.na(SummerLag),  "\u2014", as.character(SummerLag)),
+    `Top Winter Lag`   = ifelse(is.na(WinterLag),  "\u2014", as.character(WinterLag)),
+    `Lag Inclusion Pr.`= round(TopLagInclusion, 4),
+    `Sum Rec Quad`     = ifelse(is.na(SummerRecQuad),  "\u2014", SummerRecQuad),
+    `Sum Surv Quad`    = ifelse(is.na(SummerSurvQuad), "\u2014", SummerSurvQuad),
+    `Win Rec Quad`     = ifelse(is.na(WinterRecQuad),  "\u2014", WinterRecQuad),
+    `Win Surv Quad`    = ifelse(is.na(WinterSurvQuad), "\u2014", WinterSurvQuad),
+    `Quad Combo Pr.`   = round(lagInclusion, 4)
+  ) %>%
+  kable(caption = paste("Best lag and quadratic structure \u2014", SS),
+        align = c("l","c","c","c","c","c","c","c","c")) %>%
+  kable_styling(bootstrap_options = c("striped","hover"),
+                full_width = TRUE) %>%
+  row_spec(0, bold = TRUE, background = "#2C5F8A", color = "white") %>%
+  column_spec(4, bold = TRUE, color = "#1A5276") %>%
+  column_spec(9, bold = TRUE, color = "#1A5276")
+```
+
+---
+
+# Key Findings
+
+```{r interpretive-writeup, results='asis'}
+
+# ── PREAMBLE ──────────────────────────────────────────────────────────────────
+cat(sprintf(
+"## Model Summary
+
+Bayesian age-structured integrated population model (IPM) fit to brown trout
+electrofishing data at the **%s River \u2014 %s section** (%s\u2013%s).
+Flow covariates were standardised (Z-scored log-flow) prior to model fitting.
+Parameter directions and magnitudes reported below are based on the posterior
+distribution of the top-selected model; see Sections 4\u20137 for full
+posterior summaries and plots.\n\n---\n\n",
+  params$stream, params$section,
+  if (!is.null(years)) min(years) else "?",
+  if (!is.null(years)) max(years) else "?"
+))
+
+# ── MODEL DIAGRAM AND EQUATIONS ───────────────────────────────────────────────
+htmltools::HTML('
+<div style="font-family: sans-serif; font-size: 13px; margin: 0 0 24px 0;">
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     AGE-STRUCTURE DIAGRAM
+     ═══════════════════════════════════════════════════════════════════ -->
+<svg viewBox="0 0 820 130" xmlns="http://www.w3.org/2000/svg"
+     style="width:100%; max-width:820px; display:block; margin:0 auto 18px auto;">
+
+  <!-- ── flow covariate boxes ── -->
+  <rect x="10"  y="10" width="110" height="36" rx="5"
+        fill="#EBF5FB" stroke="#2E86C1" stroke-width="1.5"/>
+  <text x="65"  y="26" text-anchor="middle" font-size="11" fill="#1A5276" font-weight="bold">Summer Flow</text>
+  <text x="65"  y="40" text-anchor="middle" font-size="10" fill="#1A5276">(lag t&#x2212;k&#x2081;)</text>
+
+  <rect x="10"  y="60" width="110" height="36" rx="5"
+        fill="#F5EEF8" stroke="#8E44AD" stroke-width="1.5"/>
+  <text x="65"  y="76" text-anchor="middle" font-size="11" fill="#6C3483" font-weight="bold">Winter Flow</text>
+  <text x="65"  y="90" text-anchor="middle" font-size="10" fill="#6C3483">(lag t&#x2212;k&#x2082;)</text>
+
+  <!-- ── recruitment box ── -->
+  <rect x="170" y="28" width="130" height="48" rx="5"
+        fill="#EAFAF1" stroke="#27AE60" stroke-width="1.5"/>
+  <text x="235" y="49" text-anchor="middle" font-size="11" fill="#1E8449" font-weight="bold">Recruitment</text>
+  <text x="235" y="65" text-anchor="middle" font-size="10" fill="#1E8449">N&#x2082;[t] &#x2192; Ricker</text>
+
+  <!-- flow → recruitment arrows -->
+  <line x1="120" y1="28"  x2="168" y2="45"  stroke="#2E86C1" stroke-width="1.5"
+        marker-end="url(#arr)"/>
+  <line x1="120" y1="78"  x2="168" y2="60"  stroke="#8E44AD" stroke-width="1.5"
+        marker-end="url(#arr)"/>
+
+  <!-- ── age-3 box ── -->
+  <rect x="360" y="10" width="100" height="44" rx="5"
+        fill="#EBF5FB" stroke="#2C5F8A" stroke-width="1.5"/>
+  <text x="410" y="30" text-anchor="middle" font-size="11" fill="#1A5276" font-weight="bold">Age-3</text>
+  <text x="410" y="46" text-anchor="middle" font-size="10" fill="#1A5276">N&#x2083;[t], B&#x2083;[t]</text>
+
+  <!-- recruit → age-3 -->
+  <line x1="300" y1="52" x2="358" y2="32"  stroke="#27AE60" stroke-width="1.5"
+        marker-end="url(#arr)"/>
+
+  <!-- ── age-4+ box ── -->
+  <rect x="520" y="10" width="110" height="44" rx="5"
+        fill="#EBF5FB" stroke="#2C5F8A" stroke-width="1.5"/>
+  <text x="575" y="30" text-anchor="middle" font-size="11" fill="#1A5276" font-weight="bold">Age-4+</text>
+  <text x="575" y="46" text-anchor="middle" font-size="10" fill="#1A5276">N&#x2084;[t], B&#x2084;[t]</text>
+
+  <!-- age-3 → age-4+ via survival -->
+  <line x1="460" y1="32" x2="518" y2="32"  stroke="#2C5F8A" stroke-width="1.5"
+        marker-end="url(#arr)"/>
+
+  <!-- ── survival box ── -->
+  <rect x="360" y="72" width="270" height="44" rx="5"
+        fill="#FEF9E7" stroke="#E67E22" stroke-width="1.5"/>
+  <text x="495" y="92" text-anchor="middle" font-size="11" fill="#A04000" font-weight="bold">Annual Survival S[t]</text>
+  <text x="495" y="108" text-anchor="middle" font-size="10" fill="#A04000">logit(S) = f(flow, density)</text>
+
+  <!-- flow → survival arrows -->
+  <line x1="65"  y1="46"  x2="360" y2="85"  stroke="#2E86C1" stroke-width="1"
+        stroke-dasharray="4,3" marker-end="url(#arrd)"/>
+  <line x1="65"  y1="96"  x2="360" y2="96"  stroke="#8E44AD" stroke-width="1"
+        stroke-dasharray="4,3" marker-end="url(#arrd)"/>
+
+  <!-- survival → age transitions (dashed feedback) -->
+  <line x1="495" y1="72"  x2="460" y2="54"  stroke="#E67E22" stroke-width="1.2"
+        stroke-dasharray="3,2" marker-end="url(#arro)"/>
+  <line x1="495" y1="72"  x2="575" y2="54"  stroke="#E67E22" stroke-width="1.2"
+        stroke-dasharray="3,2" marker-end="url(#arro)"/>
+
+  <!-- ── density feedback ── -->
+  <rect x="695" y="28" width="115" height="44" rx="5"
+        fill="#FDEDEC" stroke="#C0392B" stroke-width="1.5"/>
+  <text x="752" y="46" text-anchor="middle" font-size="11" fill="#922B21" font-weight="bold">Total N[t&#x2212;1]</text>
+  <text x="752" y="62" text-anchor="middle" font-size="10" fill="#922B21">density feedback</text>
+
+  <!-- N_all[t-1] → survival -->
+  <line x1="695" y1="50"  x2="632" y2="85"  stroke="#C0392B" stroke-width="1.2"
+        marker-end="url(#arrr)"/>
+
+  <!-- age-4+ → total N feedback loop arrow (over top) -->
+  <path d="M 630 10 Q 680 -10 752 28" fill="none" stroke="#C0392B"
+        stroke-width="1" stroke-dasharray="3,2"/>
+
+  <!-- ── arrowhead markers ── -->
+  <defs>
+    <marker id="arr"  markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#2C5F8A"/>
+    </marker>
+    <marker id="arrd" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#8E44AD"/>
+    </marker>
+    <marker id="arro" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#E67E22"/>
+    </marker>
+    <marker id="arrr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#C0392B"/>
+    </marker>
+  </defs>
+</svg>
+
+<!-- ═══════════════════════════════════════════════════════════════════
+     EQUATIONS
+     ═══════════════════════════════════════════════════════════════════ -->
+<table style="border-collapse:collapse; width:100%; max-width:820px;
+              margin:0 auto; font-size:12px; line-height:1.7;">
+  <thead>
+    <tr style="background:#2C5F8A; color:white;">
+      <th style="padding:6px 10px; text-align:left; width:22%;">Sub-model</th>
+      <th style="padding:6px 10px; text-align:left;">Equation</th>
+      <th style="padding:6px 10px; text-align:left; width:32%;">Parameters</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr style="background:#EAFAF1;">
+      <td style="padding:6px 10px; font-weight:bold; color:#1E8449;">Recruitment</td>
+      <td style="padding:6px 10px; font-family:monospace;">
+        log(R[t]) = log(&alpha;) + log(S[t]) &minus; &beta;&middot;SSB[t]
+        + b1r&middot;Flow<sub>sum</sub>[t&minus;k<sub>1</sub>]
+        + b12r&middot;Flow<sub>sum</sub>[t&minus;k<sub>1</sub>]<sup>2</sup>
+        + b5r&middot;Flow<sub>win</sub>[t&minus;k<sub>2</sub>]
+        + b52r&middot;Flow<sub>win</sub>[t&minus;k<sub>2</sub>]<sup>2</sup>
+        &minus; &sigma;<sub>R</sub><sup>2</sup>/2
+      </td>
+      <td style="padding:6px 10px; color:#555;">
+        &alpha; = intrinsic productivity;<br>
+        &beta; = density dependence;<br>
+        S[t] = spawner abundance (N3+N4);<br>
+        SSB = spawner biomass (B3+B4);<br>
+        Flow = standardised log-flow;<br>
+        k<sub>1</sub>, k<sub>2</sub> = selected lags
+      </td>
+    </tr>
+    <tr style="background:#FEF9E7;">
+      <td style="padding:6px 10px; font-weight:bold; color:#A04000;">Survival</td>
+      <td style="padding:6px 10px; font-family:monospace;">
+        logit(Surv[t]) = lSurv0
+        + b1S&middot;Flow<sub>sum</sub>[t]
+        + b12S&middot;Flow<sub>sum</sub>[t]<sup>2</sup>
+        + b5S&middot;Flow<sub>win</sub>[t]
+        + b52S&middot;Flow<sub>win</sub>[t]<sup>2</sup>
+        &minus; b6S&middot;(N<sub>all</sub>[t&minus;1]/100)
+      </td>
+      <td style="padding:6px 10px; color:#555;">
+        lSurv0 = intercept;<br>
+        b6S = density effect;<br>
+        N<sub>all</sub>[t&minus;1] = total abundance, lagged 1 yr;<br>
+        flow at current year (no recruitment lag)
+      </td>
+    </tr>
+    <tr style="background:#EBF5FB;">
+      <td style="padding:6px 10px; font-weight:bold; color:#1A5276;">Age structure</td>
+      <td style="padding:6px 10px; font-family:monospace;">
+        N2[t] = recruits (from Ricker);<br>
+        N3[t] = N2[t&minus;1] &middot; Surv[t];<br>
+        N4[t] = (N3[t&minus;1] + N4[t&minus;1]) &middot; Surv[t];<br>
+        B<sub>j</sub>[t] = N<sub>j</sub>[t] &middot; w<sub>j</sub>[t]
+      </td>
+      <td style="padding:6px 10px; color:#555;">
+        w<sub>j</sub>[t] = mean individual weight,<br>
+        age class j in year t;<br>
+        B = biomass (g per survey reach)
+      </td>
+    </tr>
+    <tr style="background:#FDEDEC;">
+      <td style="padding:6px 10px; font-weight:bold; color:#922B21;">Observation</td>
+      <td style="padding:6px 10px; font-family:monospace;">
+        C<sub>j=2</sub>[t] ~ N(Q &middot; N2[t], &sigma;<sub>C<sub>j=2</sub></sub>);<br>
+        C<sub>j>2</sub>[t] ~ N(N<sub>j>2</sub>[t], &sigma;<sub>C<sub>j>2</sub></sub>)
+      </td>
+      <td style="padding:6px 10px; color:#555;">
+        C<sub>j</sub>[t] = electrofishing catch for age j;<br>
+        Q = Recruit catchability coefficient
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+<p style="font-size:11px; color:#666; margin:8px 0 0 0;">
+  Flow covariates (Flow) are Z-scored log-flow: Flow = (log(flow) &minus; &mu;) / &sigma;.
+  Terms excluded by indicator variable selection are omitted from fitted model equations in Sections 4&ndash;7.
+  Solid arrows = deterministic transitions; dashed = covariate effects; orange dashes = survival applied to age transitions.
+</p>
+
+</div>
+')
+# # ```{r, results='asis'}
+# htmltools::HTML('
+# <div style="font-family: sans-serif; font-size: 13px; margin: 0 0 24px 0;">
+# 
+# <svg viewBox="0 0 820 130" xmlns="http://www.w3.org/2000/svg"
+#      style="width:100%; max-width:820px; height:auto; display:block; margin:0 auto 18px auto;">
+# 
+#   <!-- markers -->
+#   <defs>
+#     <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+#       <path d="M0,0 L0,6 L8,3 z" fill="#2C5F8A"/>
+#     </marker>
+#     <marker id="arrd" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+#       <path d="M0,0 L0,6 L8,3 z" fill="#8E44AD"/>
+#     </marker>
+#     <marker id="arro" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+#       <path d="M0,0 L0,6 L8,3 z" fill="#E67E22"/>
+#     </marker>
+#     <marker id="arrr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto" markerUnits="strokeWidth">
+#       <path d="M0,0 L0,6 L8,3 z" fill="#C0392B"/>
+#     </marker>
+#   </defs>
+# 
+#   <!-- flow boxes -->
+#   <rect x="10" y="10" width="110" height="36" rx="5" fill="#EBF5FB" stroke="#2E86C1" stroke-width="1.5"/>
+#   <text x="65" y="26" text-anchor="middle" font-size="11" fill="#1A5276" font-weight="bold">Summer Flow</text>
+#   <text x="65" y="40" text-anchor="middle" font-size="10" fill="#1A5276">(lag t&#8722;k&#8321;)</text>
+# 
+#   <rect x="10" y="60" width="110" height="36" rx="5" fill="#F5EEF8" stroke="#8E44AD" stroke-width="1.5"/>
+#   <text x="65" y="76" text-anchor="middle" font-size="11" fill="#6C3483" font-weight="bold">Winter Flow</text>
+#   <text x="65" y="90" text-anchor="middle" font-size="10" fill="#6C3483">(lag t&#8722;k&#8322;)</text>
+# 
+#   <!-- recruitment -->
+#   <rect x="170" y="28" width="130" height="48" rx="5" fill="#EAFAF1" stroke="#27AE60" stroke-width="1.5"/>
+#   <text x="235" y="49" text-anchor="middle" font-size="11" fill="#1E8449" font-weight="bold">Recruitment</text>
+#   <text x="235" y="65" text-anchor="middle" font-size="10" fill="#1E8449">N&#8322;[t] &#8594; Ricker</text>
+# 
+#   <!-- arrows -->
+#   <line x1="120" y1="28" x2="168" y2="45" stroke="#2E86C1" stroke-width="1.5" marker-end="url(#arr)"/>
+#   <line x1="120" y1="78" x2="168" y2="60" stroke="#8E44AD" stroke-width="1.5" marker-end="url(#arr)"/>
+# 
+#   <!-- age 3 -->
+#   <rect x="360" y="10" width="100" height="44" rx="5" fill="#EBF5FB" stroke="#2C5F8A" stroke-width="1.5"/>
+#   <text x="410" y="30" text-anchor="middle" font-size="11" fill="#1A5276" font-weight="bold">Age-3</text>
+#   <text x="410" y="46" text-anchor="middle" font-size="10" fill="#1A5276">N&#8323;[t], B&#8323;[t]</text>
+# 
+#   <line x1="300" y1="52" x2="358" y2="32" stroke="#27AE60" stroke-width="1.5" marker-end="url(#arr)"/>
+# 
+#   <!-- age 4 -->
+#   <rect x="520" y="10" width="110" height="44" rx="5" fill="#EBF5FB" stroke="#2C5F8A" stroke-width="1.5"/>
+#   <text x="575" y="30" text-anchor="middle" font-size="11" fill="#1A5276" font-weight="bold">Age-4+</text>
+#   <text x="575" y="46" text-anchor="middle" font-size="10" fill="#1A5276">N&#8324;[t], B&#8324;[t]</text>
+# 
+#   <line x1="460" y1="32" x2="518" y2="32" stroke="#2C5F8A" stroke-width="1.5" marker-end="url(#arr)"/>
+# 
+#   <!-- survival -->
+#   <rect x="360" y="72" width="270" height="44" rx="5" fill="#FEF9E7" stroke="#E67E22" stroke-width="1.5"/>
+#   <text x="495" y="92" text-anchor="middle" font-size="11" fill="#A04000" font-weight="bold">Annual Survival S[t]</text>
+#   <text x="495" y="108" text-anchor="middle" font-size="10" fill="#A04000">logit(S) = f(flow, density)</text>
+# 
+# </svg>
+# 
+# <!-- equations -->
+# <table style="border-collapse:collapse; width:100%; max-width:820px; margin:0 auto; font-size:12px;">
+# <tr style="background:#2C5F8A; color:white;">
+# <th style="padding:6px;">Sub-model</th>
+# <th style="padding:6px;">Equation</th>
+# <th style="padding:6px;">Parameters</th>
+# </tr>
+# 
+# <tr>
+# <td style="padding:6px;"><b>Recruitment</b></td>
+# <td style="padding:6px; font-family:monospace;">
+# log(R[t]) = log(&#945;) + log(S[t]) &#8722; &#946;&#183;SSB[t]
+# </td>
+# <td style="padding:6px;">&#945; productivity, &#946; density</td>
+# </tr>
+# 
+# <tr>
+# <td style="padding:6px;"><b>Survival</b></td>
+# <td style="padding:6px; font-family:monospace;">
+# logit(S[t]) = lSurv0 + b1S&#183;Q[t] &#8722; b6S&#183;N[t&#8722;1]
+# </td>
+# <td style="padding:6px;">density + flow effects</td>
+# </tr>
+# 
+# </table>
+# 
+# </div>
+# ')
+# ── SUMMER FLOW → RECRUITMENT ─────────────────────────────────────────────────
+if (!is.null(sims_summer$b1r)) {
+  shape_phrase <- if (isTRUE(quad_selected(sum_rec_quad)))
+    "non-linear (quadratic)"
+  else
+    "linear"
+
+  cat(sprintf(
+"## Summer Flow and Recruitment
+
+Summer mean flow at lag **%s** had a **%s** effect on log(Recruits/Spawners),
+modelled as a %s relationship (b1r = %s%s).\n\n",
+    lag_phrase(eff_sum_lag),
+    dir_b1r,
+    shape_phrase,
+    formatC(median(sims_summer$b1r, na.rm = TRUE), format = "f", digits = 3),
+    if (isTRUE(quad_selected(sum_rec_quad)))
+      paste0(", b12r = ",
+             formatC(median(sims_summer$b12r, na.rm = TRUE), format = "f", digits = 3))
+    else ""
+  ))
+}
+
+# ── WINTER FLOW → RECRUITMENT ─────────────────────────────────────────────────
+if (!is.null(sims_winter$b5r)) {
+  shape_phrase <- if (isTRUE(quad_selected(win_rec_quad)))
+    "non-linear (quadratic)"
+  else
+    "linear"
+
+  cat(sprintf(
+"## Winter Flow and Recruitment
+
+Winter mean flow at lag **%s** had a **%s** effect on log(Recruits/Spawners),
+modelled as a %s relationship (b5r = %s%s).
+Effects on age-2 recruitment are not detectable in survey data until
+**%s**, reflecting the time from egg deposition to age-2 detection.\n\n",
+    lag_phrase(eff_win_lag),
+    dir_b5r,
+    shape_phrase,
+    formatC(median(sims_winter$b5r, na.rm = TRUE), format = "f", digits = 3),
+    if (isTRUE(quad_selected(win_rec_quad)))
+      paste0(", b52r = ",
+             formatC(median(sims_winter$b52r, na.rm = TRUE), format = "f", digits = 3))
+    else "",
+    lag_phrase(eff_win_lag)
+  ))
+}
+
+# ── FLOW → SURVIVAL ───────────────────────────────────────────────────────────
+has_surv_flow <- !is.null(sims_summer$b1S) || !is.null(sims_winter$b5S)
+
+if (has_surv_flow) {
+  cat("## Seasonal Flow and Adult Survival\n\n")
+
+  if (!is.null(sims_summer$b1S)) {
+    shape_phrase <- if (isTRUE(quad_selected(sum_surv_quad)))
+      "non-linear (quadratic)" else "linear"
+    cat(sprintf(
+"Summer flow had a **%s** effect on logit-survival, modelled as a %s
+relationship (b1S = %s%s).\n\n",
+      dir_b1S, shape_phrase,
+      formatC(median(sims_summer$b1S, na.rm = TRUE), format = "f", digits = 3),
+      if (isTRUE(quad_selected(sum_surv_quad)))
+        paste0(", b12S = ",
+               formatC(median(sims_summer$b12S, na.rm = TRUE), format = "f", digits = 3))
+      else ""
+    ))
+  }
+
+  if (!is.null(sims_winter$b5S)) {
+    shape_phrase <- if (isTRUE(quad_selected(win_surv_quad)))
+      "non-linear (quadratic)" else "linear"
+    cat(sprintf(
+"Winter flow had a **%s** effect on logit-survival, modelled as a %s
+relationship (b5S = %s%s).\n\n",
+      dir_b5S, shape_phrase,
+      formatC(median(sims_winter$b5S, na.rm = TRUE), format = "f", digits = 3),
+      if (isTRUE(quad_selected(win_surv_quad)))
+        paste0(", b52S = ",
+               formatC(median(sims_winter$b52S, na.rm = TRUE), format = "f", digits = 3))
+      else ""
+    ))
+  }
+}
+
+# ── DENSITY DEPENDENCE ────────────────────────────────────────────────────────
+if (!is.null(sims_primary$b6S)) {
+  cat(sprintf(
+"## Density Dependence in Survival
+
+The density-dependent survival parameter (b6S) was **%s**
+(median = %s), indicating that annual survival %s with increasing
+total abundance.\n\n---\n\n",
+    dir_b6S,
+    formatC(median(sims_primary$b6S, na.rm = TRUE), format = "f", digits = 4),
+    switch(dir_b6S,
+      "negative"         = "declines",
+      "positive"         = "increases",
+      "weak or uncertain" = "shows no consistent directional change"
+    )
+  ))
+} else {
+  cat("---\n\n")
+}
+
+# ── BIOMASS TREND AND EXPLAINED VARIANCE ──────────────────────────────────────
+ev_rec_text  <- if (!is.na(ev_rec_med))
+  sprintf("**%g%%** of residual recruitment variance", ev_rec_med) else
+  "an undetermined proportion of residual recruitment variance"
+
+ev_surv_text <- if (!is.na(ev_surv_med))
+  sprintf("**%g%%** of residual survival variance", ev_surv_med) else
+  "an undetermined proportion of residual survival variance"
+
+lag_text <- {
+  parts <- character(0)
+  if (!is.null(sims_summer$b1r) && !is.na(eff_sum_lag))
+    parts <- c(parts, sprintf("summer flow at lag %s", lag_phrase(eff_sum_lag)))
+  if (!is.null(sims_winter$b5r) && !is.na(eff_win_lag))
+    parts <- c(parts, sprintf("winter flow at lag %s", lag_phrase(eff_win_lag)))
+  if (length(parts) > 0) paste(parts, collapse = "; ") else "the selected flow covariates"
+}
+
+cat(sprintf(
+"## Flow Explained Variance and Biomass Trend
+
+The top flow model (%s) accounts for %s and %s relative to a null
+(no-flow) model. Total biomass over the study period showed **%s**.\n\n---\n\n",
+  lag_text,
+  ev_rec_text,
+  ev_surv_text,
+  biomass_trend_phrase
+))
+```
+
+---
+
+# 1. Abundance Time Series
+
+Age-specific abundance (N2 = age-2 recruits, N3 = age-3, N4 = age-4+). Shaded bands = 90% credible intervals.
+
+
+
+```{r abundance-ts}
+library(htmltools)
+
+sims_abund <- sims_flow %||% sims_summer %||% sims_winter
+
+if (!is.null(sims_abund) && !is.null(years)) {
+
+  abund_long <- bind_rows(
+    ts_summary(sims_abund$N2,   years) %>% mutate(Age = "Age-2 (Recruits)"),
+    ts_summary(sims_abund$N3,   years) %>% mutate(Age = "Age-3"),
+    ts_summary(sims_abund$N4,   years) %>% mutate(Age = "Age-4+"),
+    ts_summary(sims_abund$NALL, years) %>% mutate(Age = "Total")
+  ) %>%
+    mutate(Age = factor(Age, levels = c("Age-2 (Recruits)", "Age-3", "Age-4+", "Total")))
+
+  age_colors <- c("Age-2 (Recruits)" = "#1A5276", "Age-3" = "#1E8449", 
+                  "Age-4+" = "#A04000", "Total" = "#424949")
+abund_long <- abund_long %>%
+    mutate(HoverText = paste0("Year: ",Year, "<br>","Median: ", round(Median), "<br>",
+                              "90% CrI: [", round(Lo90), " - ", round(Hi90), "]"))
+
+  get_bars <- function(panel_label, season_str, hi_val) {
+    if (is.null(flow_df)) return(NULL)
+    years_num <- as.numeric(years)
+    fd <- flow_df %>%
+      mutate(Year = as.numeric(Year), SurvLag = as.numeric(SurvLag), Season = trimws(Season)) %>%
+      filter(tolower(Season) == tolower(season_str))
+    if (nrow(fd) == 0) return(NULL)
+    if (panel_label == "Age-2 (Recruits)") {
+      lag_val <- if (tolower(season_str) == "summer") 
+        (if (!is.null(eff_sum_lag)) as.numeric(eff_sum_lag) else 0) 
+        else (if (!is.null(eff_win_lag)) as.numeric(eff_win_lag) else 0)
+      fd <- fd %>% mutate(AlignYear = Year + lag_val)
+    } else {
+      fd <- fd %>% mutate(AlignYear = Year + SurvLag)
+    }
+    fd <- fd %>% filter(AlignYear %in% years_num) %>% 
+      rename(FlowYear=Year) %>% select(Year = AlignYear, FlowYear, Flow)
+    if (nrow(fd) == 0) return(NULL)
+    max_f <- max(abs(fd$Flow), na.rm = TRUE)
+    fd %>% mutate(FlowScaled = Flow / max_f * hi_val * 0.7,
+                  Tooltip = paste0('Flow Year = ', FlowYear, "<br>", round(Flow), " cfs"))
+  }
+
+  p_abund <- plot_ly()
+
+  for (lbl in levels(abund_long$Age)) {
+  d <- abund_long %>% filter(Age == lbl)
+    clr <- age_colors[lbl]
+    h <- max(d$Hi90, na.rm = TRUE) %||% 1
+
+    p_abund <- p_abund %>% 
+      add_ribbons(data = d, x = ~Year, ymin = ~Lo90, ymax = ~Hi90,
+                  fillcolor = clr, opacity = 0.15, line = list(color = "transparent"),
+                  name = paste(lbl, "CrI"), hoverinfo = "none", showlegend = FALSE,
+                  meta = list(age = lbl, type = "ribbon")) %>%
+      add_trace(data = d, x = ~Year, y = ~Median, type = 'scatter', mode = 'lines+markers',
+                line = list(color = clr, width = 3),
+                marker = list(color = clr, size = 10, line = list(color = "white", width = 1)),
+                name = lbl, showlegend = FALSE,
+                # Use the pre-formatted text column
+                text = ~HoverText,
+                hovertemplate = "%{text}<extra></extra>",
+                meta = list(age = lbl, type = "main"))
+
+    sb <- get_bars(lbl, "summer", h)
+    p_abund <- p_abund %>% add_bars(
+      data = sb %||% data.frame(Year=numeric(0), FlowScaled=numeric(0), Tooltip=""), 
+      x = ~Year, y = ~FlowScaled, text = ~Tooltip,
+      marker = list(color = "rgba(230,126,34,0.5)"), width = 0.4,
+      showlegend = FALSE, visible = FALSE, name = "Summer Flow",
+      hovertemplate = "%{text}<extra></extra>",
+      meta = list(age = lbl, type = "sumflow")
+    )
+
+    wb <- get_bars(lbl, "winter", h)
+    p_abund <- p_abund %>% add_bars(
+      data = wb %||% data.frame(Year=numeric(0), FlowScaled=numeric(0), Tooltip=""), 
+      x = ~Year, y = ~FlowScaled, text = ~Tooltip,
+      marker = list(color = "rgba(142,68,173,0.5)"), width = 0.4,
+      showlegend = FALSE, visible = FALSE, name = "Winter Flow",
+      hovertemplate = "%{text}<extra></extra>",
+      meta = list(age = lbl, type = "winflow")
+    )
+  }
+
+  abund_ui <- HTML('
+  <div style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 25px; font-family: sans-serif; font-size: 13px; margin-bottom: 5px;">
+    <div style="display: flex; align-items: center; gap: 12px;">
+      <span style="font-weight: 700; color: #334155; text-transform: uppercase; font-size: 11px;">Display:</span>
+      <label style="display: flex; align-items: center; gap: 5px; cursor: pointer;"><input type="checkbox" class="abund-age-chk" data-age="Age-2 (Recruits)" checked> Age-2</label>
+      <label style="display: flex; align-items: center; gap: 5px; cursor: pointer;"><input type="checkbox" class="abund-age-chk" data-age="Age-3"> Age-3</label>
+      <label style="display: flex; align-items: center; gap: 5px; cursor: pointer;"><input type="checkbox" class="abund-age-chk" data-age="Age-4+"> Age-4+</label>
+      <label style="display: flex; align-items: center; gap: 5px; cursor: pointer;"><input type="checkbox" class="abund-age-chk" data-age="Total"> Total</label>
+    </div>
+    <div style="width: 1px; height: 20px; background-color: #cbd5e1;"></div>
+    <div style="display: flex; align-items: center; gap: 12px;">
+      <span style="font-weight: 700; color: #334155; text-transform: uppercase; font-size: 11px;">Flow Overlay:</span>
+      <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;"><input type="checkbox" id="abund-chk-sum"><div style="width: 5px; height: 14px; background-color: #e67e22;"></div> Summer</label>
+      <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;"><input type="checkbox" id="abund-chk-win"><div style="width: 5px; height: 14px; background-color: #8e44ad;"></div> Winter</label>
+    </div>
+  </div>')
+
+  p_abund <- p_abund %>%
+    layout(
+      height = 500, title = list(text = paste0("<b>", SS, " — Abundance Time Series</b>"), x = 0),
+      xaxis = list(title = "Year", tickvals = seq(min(years), max(years), by = 5)),
+      yaxis = list(title = "Abundance (N)", autorange = TRUE),
+      hovermode = "x unified", barmode = "overlay",
+      margin = list(t = 70, b = 50, l = 60, r = 30)
+    ) %>%
+    htmlwidgets::onRender("
+      function(el) {
+        var ageChks = document.querySelectorAll('.abund-age-chk');
+        var chkSum = document.getElementById('abund-chk-sum');
+        var chkWin = document.getElementById('abund-chk-win');
+        function update() {
+          var visibleAges = [];
+          ageChks.forEach(function(c) { if(c.checked) visibleAges.push(c.getAttribute('data-age')); });
+          var targetFlowAge = (visibleAges.length === 1) ? visibleAges[0] : 'Total';
+          var updateVis = el.data.map(function(trace) {
+            if (!trace.meta) return true;
+            if (trace.meta.type === 'ribbon' || trace.meta.type === 'main') return visibleAges.includes(trace.meta.age);
+            if (trace.meta.type === 'sumflow') return (trace.meta.age === targetFlowAge) && chkSum.checked;
+            if (trace.meta.type === 'winflow') return (trace.meta.age === targetFlowAge) && chkWin.checked;
+            return true;
+          });
+          Plotly.restyle(el, {'visible': updateVis});
+        }
+        ageChks.forEach(function(c) { c.addEventListener('change', update); });
+        chkSum.addEventListener('change', update);
+        chkWin.addEventListener('change', update);
+        update(); 
+      }
+    ")
+browsable(
+  tags$div(
+    style = "margin-bottom: 40px; clear: both; overflow: auto;",
+    tagList(abund_ui, p_abund)
+  )
+)
+  # browsable(tagList(abund_ui, p_abund))
+} else {
+  cat("*Abundance time series not available.*")
+}
+```
+
+---
+
+# 2. Survival Time Series
+
+Annual survival probability (0–1 scale). Shaded band = 90% CrI.
+
+
+
+```{r survival-ts}
+library(htmltools)
+
+sims_surv  <- sims_flow %||% sims_summer %||% sims_winter
+surv_years <- years[4:length(years)]
+# Using a div wrapper with margin-top to prevent overlap
+if (!is.null(sims_surv$Surv) && !is.null(years)) {
+surv_df <- ts_summary(sims_surv$Surv, surv_years) %>%
+    mutate(HoverText = paste0("Year: ",Year, "<br>","Median: ", signif(Median,2), "<br>",
+                              "90% CrI: [", signif(Lo90,2), " - ", signif(Hi90,2), "]"))
+
+  get_surv_bars <- function(season_str) {
+    if (is.null(flow_df)) return(NULL)
+    fd <- flow_df %>%
+      mutate(Year = as.numeric(Year), SurvLag = as.numeric(SurvLag), Season = trimws(Season)) %>%
+      filter(tolower(Season) == tolower(season_str)) %>%
+      mutate(AlignYear = Year + SurvLag) %>%
+      filter(AlignYear %in% as.numeric(surv_years)) %>% 
+      rename(FlowYear=Year) %>% select(Year = AlignYear, FlowYear, Flow)
+    if (nrow(fd) == 0) return(NULL)
+    max_f <- max(abs(fd$Flow), na.rm = TRUE)
+    fd %>% mutate(FlowScaled = Flow / max_f * 0.40,
+                  Tooltip = paste0('Flow Year = ', FlowYear, "<br>", round(Flow), " cfs"))
+  }
+
+  p_surv <- plot_ly() %>%
+    add_bars(data = get_surv_bars("summer") %||% data.frame(Year=numeric(0), FlowScaled=numeric(0), Tooltip=""), 
+             x = ~Year, y = ~FlowScaled, text = ~Tooltip,
+             marker = list(color = "rgba(230,126,34,0.5)"), width = 0.4,
+             visible = FALSE, showlegend = FALSE, name = "Summer Flow",
+             hovertemplate = "%{text}<extra></extra>") %>%
+    add_bars(data = get_surv_bars("winter") %||% data.frame(Year=numeric(0), FlowScaled=numeric(0), Tooltip=""), 
+             x = ~Year, y = ~FlowScaled, text = ~Tooltip,
+             marker = list(color = "rgba(142,68,173,0.5)"), width = 0.4,
+             visible = FALSE, showlegend = FALSE, name = "Winter Flow",
+             hovertemplate = "%{text}<extra></extra>") %>%
+    add_ribbons(data = surv_df, x = ~Year, ymin = ~Lo90, ymax = ~Hi90,
+                fillcolor = "rgba(39,174,96,0.15)", line = list(color = "transparent"),
+                hoverinfo = "none", showlegend = FALSE, name = "90% CrI") %>%
+    add_trace(data = surv_df, x = ~Year, y = ~Median, 
+              type = 'scatter', mode = 'lines+markers',
+              line = list(color = "#1E8449", width = 3),
+              marker = list(color = "#1E8449", size = 10, line = list(color = "white", width = 1)),
+              showlegend = FALSE, name = "Survival",
+              # Use the pre-formatted text column
+              text = ~HoverText,
+              hovertemplate = "%{text}<extra></extra>")
+  surv_ui <- HTML('
+  <div style="background-color: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 12px 20px; display: inline-flex; align-items: center; gap: 20px; font-family: sans-serif; font-size: 13px; margin-bottom: 5px;">
+    <span style="font-weight: 700; color: #334155; text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px;">Flow Overlay:</span>
+    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0;"><input type="checkbox" id="surv-s"><div style="width: 5px; height: 14px; background-color: #e67e22;"></div> Summer</label>
+    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0;"><input type="checkbox" id="surv-w"><div style="width: 5px; height: 14px; background-color: #8e44ad;"></div> Winter</label>
+  </div>')
+
+  p_surv <- p_surv %>%
+    layout(
+      height = 500, title = list(text = paste0("<b>", SS, " — Annual Survival Probability</b>"), x = 0),
+      yaxis = list(title = "Annual Survival", tickformat = ".2f", range = c(0, 1), fixedrange = TRUE),
+      xaxis = list(title = "Year", tickvals = seq(min(surv_years), max(surv_years), by = 5)),
+      hovermode = "x unified", barmode = "overlay",
+      margin = list(t = 70, b = 50, l = 60, r = 30)
+    ) %>%
+    htmlwidgets::onRender("
+      function(el) {
+        var s = document.getElementById('surv-s');
+        var w = document.getElementById('surv-w');
+        function up() {
+          Plotly.restyle(el, {visible: s.checked}, [0]);
+          Plotly.restyle(el, {visible: w.checked}, [1]);
+        }
+        s.addEventListener('change', up);
+        w.addEventListener('change', up);
+      }
+    ")
+
+  # Use a div wrapper with 40px top margin to ensure separation
+browsable(
+  tags$div(
+    style = "margin-bottom: 40px; clear: both; overflow: auto;",
+     tagList(surv_ui, p_surv)
+  )
+)
+}else {
+  cat("*Survival time series not available.*")
+}
+```
+
+---
+
+# 3. Ricker Recruitment Model Parameters
+
+Log-linear Ricker stock–recruitment relationship: log(R) = log(α) + log(S) − β·S + flow effects − σ²_R/2, where S = spawner abundance and flow is standardised.
+
+```{r ricker-params-table}
+sims_rick <- sims_summer %||% sims_flow %||% sims_winter
+
+if (!is.null(sims_rick)) {
+  rick_rows <- bind_rows(
+    fmt_row("log(\u03b1)  [la0]",                        sims_rick$la0),
+    fmt_row("\u03b2 (density, per spawner)  [b]",         sims_rick$b,       digits = 6),
+    fmt_row("\u03c3_R  [sigmaR]",                         sims_rick$sigmaR),
+    fmt_row("Q  (catchability)",                          sims_rick$Q)
+  )
+
+  # Add flow parameters if present
+  rec_flow_rows <- bind_rows(
+    if (!is.null(sims_summer$b1r))
+      fmt_row("Summer flow (linear)  [b1r]",              sims_summer$b1r),
+    if (!is.null(sims_summer$b12r))
+      fmt_row("Summer flow (quadratic)  [b12r]",          sims_summer$b12r),
+    if (!is.null(sims_winter$b5r))
+      fmt_row("Winter flow (linear)  [b5r]",              sims_winter$b5r),
+    if (!is.null(sims_winter$b52r))
+      fmt_row("Winter flow (quadratic)  [b52r]",          sims_winter$b52r)
+  )
+
+  all_rows <- bind_rows(rick_rows, rec_flow_rows)
+
+  all_rows %>%
+    kable(caption  = paste("Ricker recruitment model parameters \u2014", SS),
+          align    = c("l", "r", "l"),
+          col.names = c("Parameter", "Median", "90% CrI")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"),
+                  full_width = FALSE) %>%
+    row_spec(0, bold = TRUE, background = "#2C5F8A", color = "white") %>%
+    row_spec(nrow(rick_rows), extra_css = "border-bottom: 2px solid #2C5F8A;")
+} else {
+  cat("*Ricker parameters not available.*")
+}
+```
+
+# 4. Flow Effects on Recruitment
+
+Posterior distributions for flow effects on log-recruitment.
+
+```{r rec-flow-params-plot, fig.height=4}
+gather_rec_posteriors <- function(sims_s, sims_w) {
+  out <- list()
+  if (!is.null(sims_s)) {
+    if (!is.null(sims_s$b1r))  out[["Summer linear\n[b1r]"]]     <- sims_s$b1r
+    if (!is.null(sims_s$b12r)) out[["Summer quadratic\n[b12r]"]] <- sims_s$b12r
+  }
+  if (!is.null(sims_w)) {
+    if (!is.null(sims_w$b5r))  out[["Winter linear\n[b5r]"]]     <- sims_w$b5r
+    if (!is.null(sims_w$b52r)) out[["Winter quadratic\n[b52r]"]] <- sims_w$b52r
+  }
+  if (length(out) == 0) return(NULL)
+  map_dfr(names(out), ~ tibble(Parameter = .x, Value = out[[.x]]))
+}
+
+rec_post <- if (has_global) gather_rec_posteriors(sims_flow, sims_flow) else
+                             gather_rec_posteriors(sims_summer, sims_winter)
+
+if (!is.null(rec_post)) {
+  ggplot(rec_post, aes(x = Value, fill = Parameter, color = Parameter)) +
+    geom_density(alpha = 0.35, linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+    scale_fill_paletteer_d("ggsci::default_igv") +
+    scale_color_paletteer_d("ggsci::default_igv") +
+    facet_wrap(~ Parameter, scales = "free", ncol = 2) +
+    labs(title = paste(SS, "\u2014 Posterior Densities: Flow Effects on Recruitment"),
+         x = "Parameter value", y = "Density") +
+    theme_report() + theme(legend.position = "none")
+} else {
+  cat("*No recruitment flow posteriors to plot.*")
+}
+```
+
+# 4b. Simulated Ricker Recruitment Curves
+
+Recruitment as a function of spawner stock biomass (SSB) simulated across three standardised summer flow scenarios (flow = −2, 0, +2 SD), holding all other parameters at their posterior medians. Shaded envelopes show 90% credible intervals propagated across the full posterior. The lognormal bias correction (−σ²_R / 2) is applied so curves represent expected median recruitment.
+
+```{r ricker-simulation, fig.height=5}
+# Parameters drawn from summer sims (or global); winter flow not shown here
+# because the Ricker plot isolates the summer flow dimension.
+sims_rick_plot <- sims_summer %||% sims_flow
+
+has_ricker_params <- !is.null(sims_rick_plot) &&
+                     !is.null(sims_rick_plot$la0) &&
+                     !is.null(sims_rick_plot$b)   &&
+                     !is.null(sims_rick_plot$sigmaR)
+
+if (has_ricker_params) {
+
+  # ── Posterior medians for key parameters ─────────────────────────────────────
+  la0_med    <- median(sims_rick_plot$la0,    na.rm = TRUE)
+  b_med      <- median(sims_rick_plot$b,      na.rm = TRUE)
+  sigR_med   <- median(sims_rick_plot$sigmaR, na.rm = TRUE)
+  b1r_med    <- if (!is.null(sims_rick_plot$b1r))  median(sims_rick_plot$b1r,  na.rm = TRUE) else 0
+  b12r_med   <- if (!is.null(sims_rick_plot$b12r)) median(sims_rick_plot$b12r, na.rm = TRUE) else 0
+
+  # ── SSB range: 0 to 1.5 × max of median Badults time series ─────────────────
+  # Badults = B3 + B4 (spawner biomass); use sims_primary which holds the top model
+  Badults_med <- if (!is.null(sims_primary$B3) && !is.null(sims_primary$B4)) {
+    apply(sims_primary$B3 + sims_primary$B4, 2, median, na.rm = TRUE)
+  } else if (!is.null(sims_primary$Badults)) {
+    apply(sims_primary$Badults, 2, median, na.rm = TRUE)
+  } else NULL
+
+  ssb_max <- if (!is.null(Badults_med)) max(Badults_med, na.rm = TRUE) * 1.5 else 1000
+  ssb_seq  <- seq(0, ssb_max, length.out = 300)
+
+  # ── Ricker formula (lognormal bias-corrected expected median) ─────────────────
+  # log(R) = la0 + log(SSB) - b*SSB + b1r*flow + b12r*flow^2 - sigmaR^2/2
+  # R      = exp(log(R))
+  ricker_R <- function(ssb, flow_val, la0, b, b1r, b12r, sigR) {
+    log_R <- la0 + log(ssb + 1e-10) - b * ssb +
+              b1r * flow_val + b12r * flow_val^2 -
+              (sigR^2) / 2
+    exp(log_R)
+  }
+
+  # ── Simulate across full posterior for CrI envelopes ─────────────────────────
+  n_iter   <- length(sims_rick_plot$la0)
+  flow_scenarios <- c(-2, 0, 2)
+  flow_labels    <- c("-2 SD (low flow)", "0 SD (average flow)", "+2 SD (high flow)")
+
+  ricker_df <- map_dfr(seq_along(flow_scenarios), function(fi) {
+    fval  <- flow_scenarios[fi]
+    flabel <- flow_labels[fi]
+
+    # For each SSB value, compute recruitment across all posterior iterations
+    map_dfr(ssb_seq, function(s) {
+      R_iter <- ricker_R(
+        ssb   = s,
+        flow_val = fval,
+        la0   = sims_rick_plot$la0,
+        b     = sims_rick_plot$b,
+        b1r   = if (!is.null(sims_rick_plot$b1r))  sims_rick_plot$b1r  else rep(0, n_iter),
+        b12r  = if (!is.null(sims_rick_plot$b12r)) sims_rick_plot$b12r else rep(0, n_iter),
+        sigR  = sims_rick_plot$sigmaR
+      )
+      tibble(
+        SSB      = s,
+        FlowScen = flabel,
+        Median   = median(R_iter, na.rm = TRUE),
+        Lo90     = quantile(R_iter, 0.10, na.rm = TRUE),
+        Hi90     = quantile(R_iter, 0.90, na.rm = TRUE)
+      )
+    })
+  }) %>%
+    mutate(FlowScen = factor(FlowScen, levels = flow_labels))
+
+  flow_palette <- c("-2 SD (low flow)"     = "#C0392B",
+                    "0 SD (average flow)"  = "#2E86C1",
+                    "+2 SD (high flow)"    = "#27AE60")
+
+  ggplot(ricker_df, aes(x = SSB, y = Median, colour = FlowScen, fill = FlowScen)) +
+    geom_ribbon(aes(ymin = Lo90, ymax = Hi90), alpha = 0.15, colour = NA) +
+    geom_line(linewidth = 1.0) +
+    scale_colour_manual(values = flow_palette, name = "Summer flow scenario") +
+    scale_fill_manual(  values = flow_palette, name = "Summer flow scenario") +
+    labs(
+      title    = paste(SS, "\u2014 Simulated Ricker Recruitment Curves"),
+      subtitle = paste0("Recruitment = exp(log(\u03b1) + log(SSB) \u2212 \u03b2\u00b7SSB ",
+                        "+ b1r\u00b7flow + b12r\u00b7flow\u00b2 \u2212 \u03c3\u00b2_R/2). ",
+                        "Envelopes = 90% CrI across posterior. ",
+                        "SSB = B3 + B4 (spawner biomass, g)."),
+      x = "Spawner Stock Biomass (SSB, g)",
+      y = "Recruits (age-2 fish)"
+    ) +
+    theme_report() +
+    theme(legend.position = "bottom")
+
+} else {
+  cat("*Ricker simulation requires la0, b, and sigmaR in model output.*")
+}
+```
+
+---
+
+# 4c. Observed Flow–Recruitment Relationship
+
+Each point is one year's estimated log(Recruits/Spawners) plotted against the observed (back-transformed) summer or winter flow for that year at the top selected lag. The blue line is the posterior median fitted relationship; the grey band is the 90% credible interval. Red points are years where log(R/S) fell below −1 (poor recruitment). The vertical dashed red line marks the flow value where the fitted curve crosses log(R/S) = 0 (replacement); where that crossing exists, the subtitle reports the range.
+
+```{r rec-flow-scatter, fig.height=5}
+# ── Compute observed log(R/S) from model posteriors ───────────────────────────
+# R[t]        = N2[t]          (age-2 recruits entering in year t)
+# Spawners[t] = B3[t-3]+B4[t-3]  (adult biomass lagged 3 years back)
+# lRS[t]      = log(R[t] / Spawners[t])
+#
+# Fitted curve at average conditions:
+#   log(R/S) = log(exp(la0) * avgWt) - Beta*meanSSB + b1r*flow_z + b12r*flow_z^2
+#              - sigmaR^2/2
+# where avgWt    = mean weight of a spawner across all years
+#       meanSSB  = mean(B3 + B4) across all iterations and years
+# Flow_z is the top-selected recruitment lag from the inclusion probability CSV,
+# back-transformed to cfs for the x-axis.
+
+sims_rec <- sims_primary
+
+has_rec  <- !is.null(sims_rec) &&
+            !is.null(sims_rec$N2) &&
+            !is.null(sims_rec$B3) &&
+            !is.null(sims_rec$B4)
+has_flow <- !is.null(flow_df) &&
+            all(c("Year","Flow","Season") %in% names(flow_df))
+
+if (has_rec && has_flow) {
+
+  # ── 1. Calculate log(R/S) per year across posterior ─────────────────────────
+  # N2 and B3/B4 are [iter x nYears] matrices.
+  # Spawner biomass must be lagged 3 years: Spawners[t] = B3[t-3] + B4[t-3].
+  # This means valid lRS starts at year index 4 (1-based).
+  N2_mat  <- sims_rec$N2
+  N3_mat  <- sims_rec$N3
+  N4_mat  <- sims_rec$N4
+  n_years <- ncol(N2_mat)
+
+  # Indices where we have both recruits and lagged spawners
+  # Spawners[t] = N3[t-3] + N4[t-3]  (abundance lagged 3 years)
+  rec_idx  <- 4:n_years           # recruits at t   (cols 4..n)
+  sp_idx   <- 1:(n_years - 3)     # spawners at t-3 (cols 1..n-3)
+
+  R_mat  <- N2_mat[, rec_idx, drop = FALSE]
+  Sp_mat <- N3_mat[, sp_idx,  drop = FALSE] + N4_mat[, sp_idx, drop = FALSE]
+
+  # log(R/S): add small constant to avoid log(0)
+  lRS_mat <- log(R_mat + 1e-6) - log(Sp_mat + 1e-6)
+
+  yrs_lrs <- as.numeric(years)[rec_idx]  # years corresponding to recruits
+
+  obs_df <- tibble(
+    Year   = yrs_lrs,
+    lRS    = apply(lRS_mat, 2, median,   na.rm = TRUE),
+    lRS_lo = apply(lRS_mat, 2, quantile, 0.10, na.rm = TRUE),
+    lRS_hi = apply(lRS_mat, 2, quantile, 0.90, na.rm = TRUE)
+  )
+
+  # ── 2. Match observed flow at the top recruitment lag ────────────────────────
+  # Season and lag come from the inclusion probability model selection.
+  use_summer_rec <- !is.null(sims_summer$b1r)
+  season_rec     <- if (use_summer_rec) "summer" else "winter"
+  lag_rec        <- if (use_summer_rec) {
+    if (!is.null(eff_sum_lag) && !is.na(eff_sum_lag)) as.numeric(eff_sum_lag) else 0
+  } else {
+    if (!is.null(eff_win_lag) && !is.na(eff_win_lag)) as.numeric(eff_win_lag) else 0
+  }
+
+  flow_rec <- flow_df %>%
+    mutate(Year   = as.numeric(Year),
+           Season = trimws(Season)) %>%
+    filter(tolower(Season) == season_rec) %>%
+    mutate(AlignYear = Year + lag_rec) %>%
+    filter(AlignYear %in% obs_df$Year) %>%
+    select(Year = AlignYear, Flow_cfs = Flow)
+
+  plot_df <- obs_df %>%
+    inner_join(flow_rec, by = "Year") %>%
+    mutate(PoorYear = lRS < -1,
+           YearCol  = if_else(PoorYear, "#C0392B", "black"))
+
+  if (nrow(plot_df) < 3) {
+    cat("*Insufficient matched flow-recruitment observations to plot.*")
+  } else {
+
+    # ── 3. Z-score log(flow) using the site's own observed distribution ───────
+    log_flow_obs <- log(plot_df$Flow_cfs)
+    mu_lf <- mean(log_flow_obs, na.rm = TRUE)
+    sd_lf <- sd(log_flow_obs,   na.rm = TRUE)
+    if (is.na(sd_lf) || sd_lf == 0) sd_lf <- 1
+    plot_df <- plot_df %>% mutate(flow_z = (log(Flow_cfs) - mu_lf) / sd_lf)
+
+    # ── 4. Posterior parameter vectors ────────────────────────────────────────
+    la0_vec  <- sims_summer$la0  %||% sims_flow$la0  %||% rep(0, 1000)
+    b_vec    <- sims_summer$b    %||% sims_flow$b    %||% rep(0, 1000)
+    b1r_vec  <- sims_summer$b1r  %||% sims_flow$b1r  %||% rep(0, 1000)
+    b12r_vec <- sims_summer$b12r %||% sims_flow$b12r %||% rep(0, 1000)
+    sigR_vec <- sims_summer$sigmaR %||% sims_flow$sigmaR %||% rep(1, 1000)
+
+    # ── 5. Average spawner weight and mean SSB for the fitted curve ───────────
+    # avgWeightSpawner = mean weight per individual spawner across all years
+    # = mean(B3+B4) / mean(N3+N4) — biomass per fish
+    avg_wt <- if (!is.null(sims_rec$N3) && !is.null(sims_rec$N4)) {
+      total_B <- sims_rec$B3 + sims_rec$B4
+      total_N <- sims_rec$N3 + sims_rec$N4 + 1e-6
+      mean(total_B / total_N, na.rm = TRUE)
+    } else {
+      1   # weight already embedded in la0 if not separately tracked
+    }
+
+    # meanSSB = grand mean of (B3+B4) across all iterations and years
+    mean_ssb <- mean(sims_rec$B3 + sims_rec$B4, na.rm = TRUE)
+
+    # ── 6. Fitted curve across full posterior ────────────────────────────────
+    # log(exp(la0) * avgWt) - Beta*meanSSB + b1r*flow_z + b12r*flow_z^2
+    #   - sigmaR^2/2
+    fz_seq   <- seq(min(plot_df$flow_z) * 1.1,
+                    max(plot_df$flow_z) * 1.1,
+                    length.out = 200)
+    fcfs_seq <- exp(fz_seq * sd_lf + mu_lf)
+
+    curve_df <- map_dfr(seq_along(fz_seq), function(i) {
+      fz  <- fz_seq[i]
+      fit <- (la0_vec + log(avg_wt)) -
+             (b_vec * mean_ssb) +
+             (b1r_vec  * fz)    +
+             (b12r_vec * fz^2)  -
+             (sigR_vec^2 / 2)
+      tibble(
+        flow_z   = fz,
+        Flow_cfs = fcfs_seq[i],
+        Med      = median(fit, na.rm = TRUE),
+        Lo90     = quantile(fit, 0.10, na.rm = TRUE),
+        Hi90     = quantile(fit, 0.90, na.rm = TRUE)
+      )
+    })
+
+    # ── 7. Replacement flow (curve crosses log(R/S) = 0) ─────────────────────
+    cross_idx <- which(diff(sign(curve_df$Med)) != 0)
+    repl_range <- if (length(cross_idx) > 0) {
+      repl_cfs <- sapply(cross_idx, function(i) {
+        x0 <- curve_df$Flow_cfs[i];   y0 <- curve_df$Med[i]
+        x1 <- curve_df$Flow_cfs[i+1]; y1 <- curve_df$Med[i+1]
+        x0 + (0 - y0) * (x1 - x0) / (y1 - y0)
+      })
+      paste0("Range of Replacement Flows = ",
+             round(min(repl_cfs)), " \u2013 ", round(max(repl_cfs)), " (cfs)")
+    } else NULL
+
+    # ── 8. Annotation label ───────────────────────────────────────────────────
+    la0_m  <- median(la0_vec,  na.rm = TRUE)
+    b_m    <- median(b_vec,    na.rm = TRUE)
+    b1r_m  <- median(b1r_vec,  na.rm = TRUE)
+    b12r_m <- median(b12r_vec, na.rm = TRUE)
+    sigR_m <- median(sigR_vec, na.rm = TRUE)
+
+    # Partial R2: correlation between observed lRS and flow-only fitted values
+    fitted_obs <- b1r_m * plot_df$flow_z + b12r_m * plot_df$flow_z^2
+    r2_val     <- if (sd(fitted_obs, na.rm = TRUE) > 0)
+                    cor(plot_df$lRS, fitted_obs, use = "complete.obs")^2
+                  else NA
+
+    eq_label <- paste0(
+      if (!is.na(r2_val)) paste0("R\u00b2 = ", round(r2_val, 2), "\n") else "",
+      "y ~ log(exp(", round(la0_m, 2), ") \u00d7 ", round(avg_wt, 1), ")",
+      " \u2212 (", formatC(b_m, format = "e", digits = 2), " \u00d7 SSB)",
+      if (b1r_m  != 0) paste0("\n + (", formatC(b1r_m,  format = "e", digits = 2),
+                               " \u00d7 log(flow))") else "",
+      if (b12r_m != 0) paste0(" + (", formatC(b12r_m, format = "e", digits = 2),
+                               " \u00d7 log(flow)\u00b2)") else "",
+      "\n \u2212 (\u03c3\u00b2_R/2 = ", round(sigR_m^2 / 2, 3), ")"
+    )
+
+    season_label <- if (use_summer_rec) "Summer" else "Winter"
+
+    # ── 9. Plot ───────────────────────────────────────────────────────────────
+    p_rec <- ggplot() +
+      geom_ribbon(data = curve_df,
+                  aes(x = Flow_cfs, ymin = Lo90, ymax = Hi90),
+                  fill = "grey75", alpha = 0.5) +
+      geom_line(data = curve_df,
+                aes(x = Flow_cfs, y = Med),
+                colour = "#2E86C1", linewidth = 0.9) +
+      geom_hline(yintercept =  0, linetype = "dashed",
+                 colour = "black", linewidth = 0.4) +
+      geom_hline(yintercept = -1, linetype = "dotdash",
+                 colour = "black", linewidth = 0.4)
+
+    # Replacement flow vertical line(s)
+    if (length(cross_idx) > 0) {
+      repl_cfs_vec <- sapply(cross_idx, function(i) {
+        x0 <- curve_df$Flow_cfs[i]; y0 <- curve_df$Med[i]
+        x1 <- curve_df$Flow_cfs[i+1]; y1 <- curve_df$Med[i+1]
+        x0 + (0 - y0) * (x1 - x0) / (y1 - y0)
+      })
+      p_rec <- p_rec +
+        geom_vline(xintercept = repl_cfs_vec,
+                   linetype = "dashed", colour = "#C0392B", linewidth = 0.8)
+    }
+
+    p_rec +
+      geom_linerange(data = plot_df,
+                     aes(x = Flow_cfs, ymin = lRS_lo, ymax = lRS_hi),
+                     colour = plot_df$YearCol, linewidth = 0.35, alpha = 0.55) +
+      geom_point(data = plot_df,
+                 aes(x = Flow_cfs, y = lRS),
+                 colour = plot_df$YearCol, size = 2.3) +
+      geom_text(data = plot_df,
+                aes(x = Flow_cfs, y = lRS, label = Year),
+                colour = plot_df$YearCol,
+                size = 2.8, vjust = -0.65, hjust = 0.5) +
+      annotate("text",
+               x     = min(plot_df$Flow_cfs),
+               y     = max(plot_df$lRS_hi, na.rm = TRUE),
+               label = eq_label,
+               hjust = 0, vjust = 1, size = 2.8, colour = "grey30") +
+      labs(
+        title    = paste0(SS, "\n",
+                          if (!is.null(repl_range)) repl_range
+                          else "No replacement flow crossing detected"),
+        subtitle = paste0(season_label, " flow, lag = ", lag_rec, " yr(s). ",
+                          "Red = years with log(R/S) < \u22121. ",
+                          "Dashed = log(R/S) = 0; dot-dash = log(R/S) = \u22121. ",
+                          "Grey band = 90% CrI."),
+        x = paste0(season_label, " Flow (cfs, log scale)"),
+        y = "log(Recruits / Spawner Biomass)"
+      ) +
+      scale_x_log10(labels = scales::comma) +
+      theme_report() +
+      theme(plot.title = element_text(size = 11, face = "bold"))
+  }
+
+} else {
+  cat("*N2, B3, or B4 time series not available \u2014 cannot compute log(R/S).*")
+}
+```
+
+---
+
+# 5. Flow Effects on Survival
+
+Posterior distributions for flow and density effects on logit-survival.
+
+```{r surv-flow-params-table}
+build_surv_table <- function(sims_s, sims_w) {
+  rows <- list()
+  if (!is.null(sims_s)) {
+    if (!is.null(sims_s$b1S))  rows[["b1S"]]  <- fmt_row("Summer flow (linear)  [b1S]",    sims_s$b1S)
+    if (!is.null(sims_s$b12S)) rows[["b12S"]] <- fmt_row("Summer flow (quadratic) [b12S]", sims_s$b12S)
+  }
+  if (!is.null(sims_w)) {
+    if (!is.null(sims_w$b5S))  rows[["b5S"]]  <- fmt_row("Winter flow (linear)  [b5S]",    sims_w$b5S)
+    if (!is.null(sims_w$b52S)) rows[["b52S"]] <- fmt_row("Winter flow (quadratic) [b52S]", sims_w$b52S)
+  }
+  sims_any <- sims_s %||% sims_w
+  if (!is.null(sims_any)) {
+    if (!is.null(sims_any$b6S))       rows[["b6S"]]       <- fmt_row("Density dependence [b6S]",       sims_any$b6S)
+    if (!is.null(sims_any$lSurv0))    rows[["lSurv0"]]    <- fmt_row("Intercept logit-surv [lSurv0]",  sims_any$lSurv0)
+    if (!is.null(sims_any$sigmaSurv)) rows[["sigmaSurv"]]  <- fmt_row("\u03c3_Surv [sigmaSurv]",        sims_any$sigmaSurv)
+  }
+  bind_rows(rows)
+}
+
+surv_tbl <- if (has_global) build_surv_table(sims_flow, sims_flow) else
+                             build_surv_table(sims_summer, sims_winter)
+
+if (nrow(surv_tbl) > 0) {
+  surv_tbl %>%
+    kable(caption = paste("Flow & density effects on survival \u2014", SS),
+          align   = c("l", "r", "l")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"),
+                  full_width = FALSE) %>%
+    row_spec(0, bold = TRUE, background = "#2C5F8A", color = "white")
+} else {
+  cat("*Survival flow parameters not available.*")
+}
+```
+
+```{r surv-flow-params-plot, fig.height=4.5}
+gather_surv_posteriors <- function(sims_s, sims_w) {
+  out      <- list()
+  sims_any <- sims_s %||% sims_w
+  if (!is.null(sims_s)) {
+    if (!is.null(sims_s$b1S))  out[["Summer linear\n[b1S]"]]     <- sims_s$b1S
+    if (!is.null(sims_s$b12S)) out[["Summer quadratic\n[b12S]"]] <- sims_s$b12S
+  }
+  if (!is.null(sims_w)) {
+    if (!is.null(sims_w$b5S))  out[["Winter linear\n[b5S]"]]     <- sims_w$b5S
+    if (!is.null(sims_w$b52S)) out[["Winter quadratic\n[b52S]"]] <- sims_w$b52S
+  }
+  if (!is.null(sims_any) && !is.null(sims_any$b6S))
+    out[["Density\n[b6S]"]] <- sims_any$b6S
+  if (length(out) == 0) return(NULL)
+  map_dfr(names(out), ~ tibble(Parameter = .x, Value = out[[.x]]))
+}
+
+surv_post <- if (has_global) gather_surv_posteriors(sims_flow, sims_flow) else
+                              gather_surv_posteriors(sims_summer, sims_winter)
+
+if (!is.null(surv_post)) {
+  ggplot(surv_post, aes(x = Value, fill = Parameter, color = Parameter)) +
+    geom_density(alpha = 0.35, linewidth = 0.8) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray40") +
+    scale_fill_paletteer_d("ggsci::default_igv") +
+    scale_color_paletteer_d("ggsci::default_igv") +
+    facet_wrap(~ Parameter, scales = "free", ncol = 2) +
+    labs(title = paste(SS, "\u2014 Posterior Densities: Flow & Density Effects on Survival"),
+         x = "Parameter value", y = "Density") +
+    theme_report() + theme(legend.position = "none")
+} else {
+  cat("*No survival flow posteriors to plot.*")
+}
+```
+
+---
+
+# 5b. Observed Flow–Survival Relationship
+
+Each point is one year’s density-adjusted survival probability (0–1) plotted against observed flow, lagged 0 or 1 year depending on flow season and sampling season. The density contribution (b6S×NALL[t−1]/100) is removed from each year's estimate so the scatter reflects the flow–survival relationship. The blue curve is the posterior median fitted survival probability holding abundance at its median; the grey band is the 90% credible interval. Red points are years below the median observed survival.
+
+```{r surv-flow-scatter, fig.height=5}
+# ── Survival scatter on the probability scale (0–1) ───────────────────────────
+# Observed survival per year = plogis(median logit-survival posterior).
+# The fitted curve includes the density component b6S*(NALL[t-1]/100),
+# evaluated at the observed NALL[t-1] for each year so density variation is
+# accounted for before we display the flow–survival relationship.
+#
+# Fitted partial-effect for flow (holding density at its observed year-specific
+# value and back-transforming):
+#   logit_fit[t] = lSurv0 - b6S*(NALL[t-1]/100) + b1S*flow_z + b12S*flow_z^2
+#   Surv_fit[t]  = plogis(logit_fit[t])
+#
+# The smooth fitted curve shown is evaluated over a flow grid with NALL fixed
+# at its median across all years.
+
+has_Surv  <- !is.null(sims_primary) && !is.null(sims_primary$Surv)
+has_flow2 <- !is.null(flow_df) &&
+             all(c("Year","Flow","Season","SurvLag") %in% names(flow_df))
+
+if (has_Surv && has_flow2) {
+
+  # ── 1. Posterior survival (probability scale) per year ───────────────────────
+  surv_mat <- sims_primary$Surv          # [iter x nYears]  already on (0,1)
+  ny2      <- ncol(surv_mat)
+  yrs_sv   <- as.numeric(tail(years, ny2))
+
+  surv_obs_df <- tibble(
+    Year     = yrs_sv,
+    Surv     = apply(surv_mat, 2, median,   na.rm = TRUE),
+    Surv_lo  = apply(surv_mat, 2, quantile, 0.10, na.rm = TRUE),
+    Surv_hi  = apply(surv_mat, 2, quantile, 0.90, na.rm = TRUE)
+  )
+
+  # ── 2. Year-specific NALL[t-1] for the density term ─────────────────────────
+  # NALL is [iter x nYears]; lag by 1 to get abundance in the previous year.
+  if (!is.null(sims_primary$NALL)) {
+    NALL_mat  <- sims_primary$NALL
+    # NALL[t-1]: drop last column (recruits), drop first column (lag origin)
+    # Align to the survival years (survival starts at year 4 relative to pop start)
+    # surv_mat has ny2 columns; NALL[t-1] for those years = NALL cols (t-1)
+    # If NALL has same ncol as years, lag-1 indices are (surv_year_idx - 1)
+    n_full    <- length(years)
+    sv_yridx  <- (n_full - ny2 + 1):n_full        # column indices of surv years in full series
+    lag1_idx  <- sv_yridx - 1                       # NALL[t-1] indices
+    lag1_idx  <- pmax(lag1_idx, 1)                  # clamp to valid range
+
+    NALL_lag1_vec <- apply(NALL_mat[, lag1_idx, drop = FALSE], 2,
+                           median, na.rm = TRUE)
+    surv_obs_df <- surv_obs_df %>%
+      mutate(NALL_lag1 = NALL_lag1_vec)
+  } else {
+    surv_obs_df <- surv_obs_df %>% mutate(NALL_lag1 = 0)
+  }
+
+  # ── 3. Match observed flow (lagged 0 or 1 year by season/sampling timing) ─────
+  use_summer_surv <- !is.null(sims_summer$b1S)
+  season_surv     <- if (use_summer_surv) "summer" else "winter"
+
+  flow_surv <- flow_df %>%
+    mutate(Year    = as.numeric(Year),
+           SurvLag = as.numeric(SurvLag),
+           Season  = trimws(Season)) %>%
+    filter(tolower(Season) == season_surv) %>%
+    mutate(AlignYear = Year + SurvLag) %>%
+    filter(AlignYear %in% surv_obs_df$Year) %>%
+    select(Year = AlignYear, Flow_cfs = Flow)
+
+  splot_df <- surv_obs_df %>%
+    inner_join(flow_surv, by = "Year") %>%
+    mutate(med_surv = median(Surv, na.rm = TRUE),
+           PoorYear = Surv < med_surv,
+           YearCol  = if_else(PoorYear, "#C0392B", "black"))
+
+  if (nrow(splot_df) < 3) {
+    cat("*Insufficient matched flow-survival observations to plot.*")
+  } else {
+
+    # ── 4. Z-score log(flow) ─────────────────────────────────────────────────
+    log_flow_sv <- log(splot_df$Flow_cfs)
+    mu_lf_sv    <- mean(log_flow_sv, na.rm = TRUE)
+    sd_lf_sv    <- sd(log_flow_sv,   na.rm = TRUE)
+    if (is.na(sd_lf_sv) || sd_lf_sv == 0) sd_lf_sv <- 1
+    splot_df <- splot_df %>%
+      mutate(flow_z = (log(Flow_cfs) - mu_lf_sv) / sd_lf_sv)
+
+    # ── 5. Posterior parameter vectors ────────────────────────────────────────
+    lSurv0_vec <- sims_primary$lSurv0 %||% rep(0, 1000)
+    b6S_vec    <- sims_primary$b6S    %||% rep(0, 1000)
+    b1S_vec    <- sims_summer$b1S  %||% sims_flow$b1S  %||% rep(0, 1000)
+    b12S_vec   <- sims_summer$b12S %||% sims_flow$b12S %||% rep(0, 1000)
+    n_iter     <- length(lSurv0_vec)
+
+    # ── 6. Density-adjusted observed survival (remove density effect) ─────────
+    # For each year, remove the year-specific density contribution so the
+    # residual variation reflects flow and process error only.
+    b6S_med  <- median(b6S_vec,    na.rm = TRUE)
+    lS0_med  <- median(lSurv0_vec, na.rm = TRUE)
+    b1S_med  <- median(b1S_vec,    na.rm = TRUE)
+    b12S_med <- median(b12S_vec,   na.rm = TRUE)
+
+    # Density-adjusted logit-survival: remove b6S*(NALL[t-1]/100)
+    splot_df <- splot_df %>%
+      mutate(
+        dens_effect  = b6S_med * (NALL_lag1 / 100),
+        # Back out density: logit(Surv_obs) - density_effect
+        logit_obs    = qlogis(pmax(pmin(Surv, 1 - 1e-6), 1e-6)),
+        logit_adj    = logit_obs - dens_effect,
+        Surv_adj     = plogis(logit_adj),
+        Surv_adj_lo  = plogis(qlogis(pmax(pmin(Surv_lo, 1-1e-6), 1e-6)) - dens_effect),
+        Surv_adj_hi  = plogis(qlogis(pmax(pmin(Surv_hi, 1-1e-6), 1e-6)) - dens_effect)
+      )
+
+    # ── 7. Smooth fitted curve over flow grid (NALL at median) ───────────────
+    NALL_med_val <- median(splot_df$NALL_lag1, na.rm = TRUE)
+
+    fz_sv_seq   <- seq(min(splot_df$flow_z) * 1.1,
+                       max(splot_df$flow_z) * 1.1,
+                       length.out = 200)
+    fcfs_sv_seq <- exp(fz_sv_seq * sd_lf_sv + mu_lf_sv)
+
+    scurve_df <- map_dfr(seq_along(fz_sv_seq), function(i) {
+      fz   <- fz_sv_seq[i]
+      logit_fit <- lSurv0_vec -
+                   b6S_vec * (NALL_med_val / 100) +
+                   b1S_vec  * fz +
+                   b12S_vec * fz^2
+      surv_fit  <- plogis(logit_fit)
+      tibble(
+        flow_z   = fz,
+        Flow_cfs = fcfs_sv_seq[i],
+        Med      = median(surv_fit, na.rm = TRUE),
+        Lo90     = quantile(surv_fit, 0.10, na.rm = TRUE),
+        Hi90     = quantile(surv_fit, 0.90, na.rm = TRUE)
+      )
+    })
+
+    # ── 8. Partial R² (flow terms only vs density-adjusted survival) ─────────
+    fitted_flow_only <- b1S_med * splot_df$flow_z +
+                        b12S_med * splot_df$flow_z^2
+    r2_sv <- if (sd(fitted_flow_only, na.rm = TRUE) > 0)
+               cor(splot_df$logit_adj, fitted_flow_only,
+                   use = "complete.obs")^2
+             else NA
+
+    eq_sv <- paste0(
+      if (!is.na(r2_sv)) paste0("R\u00b2 = ", round(r2_sv, 2), "\n") else "",
+      "y ~ plogis(", round(lS0_med, 2),
+      " \u2212 (", formatC(b6S_med, format = "e", digits = 2),
+      " \u00d7 NALL[t-1]/100)",
+      if (b1S_med  != 0) paste0("\n + (", formatC(b1S_med,  format = "e", digits = 2),
+                                 " \u00d7 log(flow))") else "",
+      if (b12S_med != 0) paste0(" + (", formatC(b12S_med, format = "e", digits = 2),
+                                 " \u00d7 log(flow)\u00b2)") else "",
+      ")"
+    )
+
+    season_sv_label <- if (use_summer_surv) "Summer" else "Winter"
+    med_surv_prob   <- round(median(splot_df$Surv, na.rm = TRUE), 3)
+
+    # ── 9. Plot ───────────────────────────────────────────────────────────────
+    ggplot() +
+      # Fitted curve ribbon + line (density held at median)
+      geom_ribbon(data = scurve_df,
+                  aes(x = Flow_cfs, ymin = Lo90, ymax = Hi90),
+                  fill = "grey75", alpha = 0.5) +
+      geom_line(data = scurve_df,
+                aes(x = Flow_cfs, y = Med),
+                colour = "#27AE60", linewidth = 0.9) +
+      # Reference lines
+      geom_hline(yintercept = median(splot_df$Surv, na.rm = TRUE),
+                 linetype = "dotdash", colour = "black", linewidth = 0.4) +
+      # Density-adjusted observed survival per year (90% CrI + point + label)
+      geom_linerange(data = splot_df,
+                     aes(x = Flow_cfs, ymin = Surv_adj_lo, ymax = Surv_adj_hi),
+                     colour = splot_df$YearCol, linewidth = 0.35, alpha = 0.55) +
+      geom_point(data = splot_df,
+                 aes(x = Flow_cfs, y = Surv_adj),
+                 colour = splot_df$YearCol, size = 2.3) +
+      geom_text(data = splot_df,
+                aes(x = Flow_cfs, y = Surv_adj, label = Year),
+                colour = splot_df$YearCol,
+                size = 2.8, vjust = -0.65, hjust = 0.5) +
+      # Equation annotation
+      annotate("text",
+               x     = min(splot_df$Flow_cfs),
+               y     = max(splot_df$Surv_adj_hi, na.rm = TRUE),
+               label = eq_sv,
+               hjust = 0, vjust = 1, size = 2.8, colour = "grey30") +
+      scale_y_continuous(
+        labels = scales::number_format(accuracy = 0.01),
+        limits = c(
+          max(0,   min(scurve_df$Lo90,  splot_df$Surv_adj_lo, na.rm = TRUE) - 0.05),
+          min(1,   max(scurve_df$Hi90,  splot_df$Surv_adj_hi, na.rm = TRUE) + 0.05)
+        )
+      ) +
+      scale_x_log10(labels = scales::comma) +
+      labs(
+        title    = paste0(SS, "  |  Median survival = ", round(med_surv_prob, 3)),
+        subtitle = paste0(
+          season_sv_label, " flow (lagged 0 or 1 year depending on flow season and sampling season). ",
+          "Points = density-adjusted survival (b6S\u00d7NALL[t-1]/100 removed). ",
+          "Curve = fitted at median NALL. ",
+          "Red = below-median survival. ",
+          paste0("Dot-dash = median survival = ", round(med_surv_prob, 3), ". "),
+          "Grey band = 90% CrI."),
+        x = paste0(season_sv_label, " Flow (cfs, log scale)"),
+        y = "Annual Survival (probability)"
+      ) +
+      theme_report() +
+      theme(plot.title = element_text(size = 11, face = "bold"))
+  }
+
+} else {
+  cat("*Surv posterior or flow data not available for this site.*")
+}
+```
+
+---
+
+# 6. Explained Residual Variance
+
+Proportion of residual variance in recruitment (σ_R) and survival (σ_Surv) explained by the flow model relative to a null (no-flow) model.
+
+**Formula:** Explained variance = 1 − (σ_flow / σ_null)
+
+Positive values indicate the flow model reduces unexplained variation; negative values indicate the flow model inflates it.
+
+```{r explained-variance-table}
+ev_rows <- bind_rows(
+  if (!is.null(ev_rec))  fmt_row("Recruitment (\u03c3_R)",  ev_rec,  digits = 3),
+  if (!is.null(ev_surv)) fmt_row("Survival (\u03c3_Surv)",  ev_surv, digits = 3)
+)
+
+if (nrow(ev_rows) > 0) {
+  ev_rows %>%
+    kable(caption = paste("Explained residual variance \u2014 flow vs. null model \u2014", SS),
+          align   = c("l", "r", "l")) %>%
+    kable_styling(bootstrap_options = c("striped", "hover"),
+                  full_width = FALSE) %>%
+    row_spec(0, bold = TRUE, background = "#2C5F8A", color = "white") %>%
+    column_spec(2, bold = TRUE, color = "#1A5276")
+} else {
+  cat("*Residual-variance comparison not available (missing null or flow model).*")
+}
+```
+
+```{r explained-variance-plot, fig.height=4}
+ev_list <- list()
+if (!is.null(ev_rec))  ev_list[["Recruitment (sigma_R)"]]  <- ev_rec
+if (!is.null(ev_surv)) ev_list[["Survival (sigma_Surv)"]] <- ev_surv
+
+if (length(ev_list) > 0) {
+  map_dfr(names(ev_list), ~ tibble(Process = .x, EV = ev_list[[.x]])) %>%
+    ggplot(aes(x = EV, fill = Process, color = Process)) +
+    geom_density(alpha = 0.4, linewidth = 0.9) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray30") +
+    scale_fill_manual(values  = c("Recruitment (sigma_R)"  = "#E74C3C",
+                                  "Survival (sigma_Surv)"  = "#27AE60")) +
+    scale_color_manual(values = c("Recruitment (sigma_R)"  = "#C0392B",
+                                  "Survival (sigma_Surv)"  = "#1E8449")) +
+    labs(title    = paste(SS, "\u2014 Posterior: Explained Residual Variance"),
+         subtitle = "1 \u2212 (\u03c3_flow / \u03c3_null). Dashed line = 0 (no improvement).",
+         x = "Explained Variance", y = "Density", fill = NULL, color = NULL) +
+    theme_report() + theme(legend.position = "bottom")
+} else {
+  cat("*No explained-variance posteriors to plot.*")
+}
+```
+
+```{r sigma-comparison-plot, fig.height=4}
+sigma_df_list <- list()
+
+if (!is.null(sigmaR_null) && !is.null(sigmaR_flow))
+  sigma_df_list[["Recruitment (\u03c3_R)"]] <- tibble(
+    Value = c(sigmaR_null, sigmaR_flow),
+    Model = rep(c("Null", "Flow"), c(length(sigmaR_null), length(sigmaR_flow)))
+  )
+if (!is.null(sigmaSurv_null) && !is.null(sigmaSurv_flow))
+  sigma_df_list[["Survival (\u03c3_Surv)"]] <- tibble(
+    Value = c(sigmaSurv_null, sigmaSurv_flow),
+    Model = rep(c("Null", "Flow"), c(length(sigmaSurv_null), length(sigmaSurv_flow)))
+  )
+
+if (length(sigma_df_list) > 0) {
+  bind_rows(sigma_df_list, .id = "Process") %>%
+    mutate(Model = factor(Model, levels = c("Null", "Flow"))) %>%
+    ggplot(aes(x = Value, fill = Model, color = Model)) +
+    geom_density(alpha = 0.4, linewidth = 0.8) +
+    scale_fill_manual(values  = c("Null" = "#AAB7B8", "Flow" = "#2E86C1")) +
+    scale_color_manual(values = c("Null" = "#717D7E", "Flow" = "#1A5276")) +
+    facet_wrap(~ Process, scales = "free", ncol = 2) +
+    labs(title    = paste(SS, "\u2014 Sigma Posteriors: Flow Model vs. Null Model"),
+         subtitle = "Leftward shift in Flow model indicates improved fit.",
+         x = "\u03c3", y = "Density", fill = NULL, color = NULL) +
+    theme_report() + theme(legend.position = "bottom")
+} else {
+  cat("*Sigma comparison not available.*")
+}
+```
+
+---
+
+# Appendix: Full Model Selection Details
+
+This appendix documents the full model-selection process used to arrive at the top-selected flow structure reported above. The IPM was fit repeatedly across all candidate flow-lag combinations and linear/quadratic shape combinations for each demographic process (recruitment and survival). Bayesian indicator variables track how often each lag and each quadratic term is included in the posterior, providing a natural measure of support.
+
+## Lag Inclusion Probabilities
+
+Posterior probability that each candidate flow lag is included in the model, by sub-model type. Bars to the right of the dashed line indicate support greater than the equal prior probability; the selected top lag for each sub-model is highlighted.
+
+```{r appendix-lag-bar, fig.height=4.5}
+ggplot(lag_summary,
+       aes(x = reorder(LagLabel, AllInclusion), y = AllInclusion, fill = IsTop)) +
+  geom_col(width = 0.7, color = "white") +
+  geom_hline(yintercept = 1/3, linetype = "dashed", color = "gray50") +
+  scale_fill_manual(
+    values = c("FALSE" = "#A8C8E8", "TRUE" = "#1A5276"),
+    labels = c("FALSE" = "Other lags", "TRUE" = "Top lag (selected)"),
+    name   = NULL
+  ) +
+  facet_wrap(~ RowModelType, scales = "free_x") +
+  labs(
+    title    = paste(SS, "\u2014 Lag Inclusion Probabilities"),
+    subtitle = "Dashed line = equal prior probability (1/3).",
+    x        = "Flow Lag  (S = summer years prior, W = winter years prior)",
+    y        = "Inclusion Probability"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    strip.background = element_rect(fill = "#2C5F8A"),
+    strip.text       = element_text(color = "white", face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r appendix-lag-heatmap, fig.height=4, eval=has_global}
+# Heatmap only renders for global model sites
+ggplot(lag_summary %>% filter(RowModelType == "Global (Summer + Winter)"),
+       aes(x = factor(WinterLag), y = factor(SummerLag), fill = AllInclusion)) +
+  geom_tile(color = "white", linewidth = 1) +
+  geom_text(aes(label = sprintf("%.3f", AllInclusion)),
+            size = 4, color = "white", fontface = "bold") +
+  scale_fill_gradient2(
+    low      = "#EBF5FB",
+    mid      = "#2E86C1",
+    high     = "#1A5276",
+    midpoint = 1/9,
+    name     = "Inclusion\nPr."
+  ) +
+  labs(
+    title    = paste(SS, "\u2014 Joint Summer \u00d7 Winter Lag Inclusion (Global Model)"),
+    subtitle = "Equal prior = 1/9.",
+    x        = "Winter Flow Lag (years prior)",
+    y        = "Summer Flow Lag (years prior)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(panel.grid = element_blank())
+```
+
+## Quadratic Term Inclusion — All Lag Combinations
+
+These panels show the probability of preferring a quadratic over a linear flow–response for each demographic process, across every evaluated lag combination. Points are shaded by lag inclusion probability; the red-bordered point marks the top-selected lag for that sub-model.
+
+```{r appendix-quad-across-lags, fig.height=6}
+quad_long <- site_data %>%
+  distinct(RowModelType, SummerLag, WinterLag, AllInclusion,
+           quadInclusionRecSUM, quadInclusionRecWINT,
+           quadInclusionSurvSUM, quadInclusionSurvWINT) %>%
+  left_join(lag_summary %>% select(RowModelType, SummerLag, WinterLag,
+                                   LagLabel, IsTop),
+            by = c("RowModelType", "SummerLag", "WinterLag")) %>%
+  pivot_longer(
+    cols      = starts_with("quadInclusion"),
+    names_to  = "Process",
+    values_to = "QuadProb"
+  ) %>%
+  filter(!is.na(QuadProb)) %>%
+  mutate(
+    ProcessLabel = recode(Process,
+      "quadInclusionRecSUM"   = "Summer \u2192 Recruitment",
+      "quadInclusionRecWINT"  = "Winter \u2192 Recruitment",
+      "quadInclusionSurvSUM"  = "Summer \u2192 Survival",
+      "quadInclusionSurvWINT" = "Winter \u2192 Survival"
+    )
+  )
+
+ggplot(quad_long,
+       aes(x = LagLabel, y = QuadProb,
+           fill = AllInclusion, color = IsTop, size = IsTop)) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "gray60") +
+  geom_point(shape = 21, stroke = 1.2) +
+  scale_fill_gradient(low = "#D6EAF8", high = "#1A5276",
+                      name = "Lag inclusion\nprobability") +
+  scale_color_manual(values = c("FALSE" = "gray70", "TRUE" = "#E74C3C"),
+                     labels = c("FALSE" = "Other lags", "TRUE" = "Top lag"),
+                     name = NULL) +
+  scale_size_manual(values = c("FALSE" = 3, "TRUE" = 5), guide = "none") +
+  facet_wrap(~ ProcessLabel, ncol = 2) +
+  labs(
+    title    = paste(SS, "\u2014 Quadratic Inclusion Probability by Lag & Process"),
+    subtitle = "Red border = selected top lag. Dashed line = 0.5.",
+    x        = "Lag Combination",
+    y        = "P(Quadratic term included)"
+  ) +
+  theme_bw(base_size = 10) +
+  theme(
+    strip.background = element_rect(fill = "#2C5F8A"),
+    strip.text       = element_text(color = "white", face = "bold"),
+    axis.text.x      = element_text(angle = 45, hjust = 1),
+    legend.position  = "right",
+    panel.grid.minor = element_blank()
+  )
+```
+
+## Full Inclusion Probability Table
+
+All lag \u00d7 quadratic combinations, sorted by lag inclusion probability then quadratic combination inclusion probability.
+
+```{r appendix-full-table}
+site_data %>%
+  arrange(RowModelType, desc(AllInclusion), desc(lagInclusion)) %>%
+  transmute(
+    `Sub-model`    = RowModelType,
+    `Summer Lag`   = ifelse(is.na(SummerLag), "\u2014", as.character(SummerLag)),
+    `Winter Lag`   = ifelse(is.na(WinterLag), "\u2014", as.character(WinterLag)),
+    `Lag Pr.`      = round(AllInclusion, 4),
+    `Sum Rec Q`    = ifelse(is.na(SummerRecQuad),  "\u2014", SummerRecQuad),
+    `Sum Surv Q`   = ifelse(is.na(SummerSurvQuad), "\u2014", SummerSurvQuad),
+    `Win Rec Q`    = ifelse(is.na(WinterRecQuad),  "\u2014", WinterRecQuad),
+    `Win Surv Q`   = ifelse(is.na(WinterSurvQuad), "\u2014", WinterSurvQuad),
+    `Quad Combo Pr.` = round(lagInclusion, 4),
+    `Q Pr Sum Rec`   = round(quadInclusionRecSUM,  3),
+    `Q Pr Win Rec`   = round(quadInclusionRecWINT, 3),
+    `Q Pr Sum Surv`  = round(quadInclusionSurvSUM, 3),
+    `Q Pr Win Surv`  = round(quadInclusionSurvWINT, 3)
+  ) %>%
+  kable(caption = paste("All lag/quadratic combinations \u2014", SS)) %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                font_size = 9, full_width = TRUE) %>%
+  row_spec(0, bold = TRUE, background = "#2C5F8A", color = "white")
+```
+
+---
+
+```{=html}
+<script>
+// Toggle summer/winter flow bars on the abundance single plot.
+// Traces per age group (5 each, 4 groups): ribbon, line, pts, sum_bar, win_bar.
+// Summer bars at 0-based indices 3,8,13,18; winter at 4,9,14,19.
+// We only make a bar visible if its parent age group is also currently visible
+// (checked via the ribbon trace visibility for each group).
+function toggleAbundFlow() {
+  var el = document.getElementById('abund-plot');
+  if (!el) return;
+  var sum = document.getElementById('cb_sum_abund').checked;
+  var win = document.getElementById('cb_win_abund').checked;
+  var nGroups = 4;
+  var sumIdx = [], winIdx = [], sumVis = [], winVis = [];
+  for (var g = 0; g < nGroups; g++) {
+    var ribbonVis = el.data[g * 5].visible;   // ribbon = first trace of each group
+    var groupOn   = (ribbonVis === true);
+    sumIdx.push(g * 5 + 3);
+    winIdx.push(g * 5 + 4);
+    sumVis.push(groupOn && sum ? true : false);
+    winVis.push(groupOn && win ? true : false);
+  }
+  Plotly.restyle(el, {visible: sumVis}, sumIdx);
+  Plotly.restyle(el, {visible: winVis}, winIdx);
+}
+
+// Toggle flow bars on the survival plot (trace 3=summer, 4=winter).
+function toggleSurvFlow() {
+  var el = document.getElementById('surv-plot');
+  if (!el) return;
+  var sum = document.getElementById('cb_sum_surv').checked;
+  var win = document.getElementById('cb_win_surv').checked;
+  Plotly.restyle(el, {visible: sum ? true : false}, [3]);
+  Plotly.restyle(el, {visible: win ? true : false}, [4]);
+}
+</script>
+```
+
+
+<!-- # Session Info -->
+
+<!-- ```{r session-info} -->
+<!-- sessionInfo() -->
+<!-- ``` -->
