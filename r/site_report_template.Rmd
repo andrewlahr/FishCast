@@ -16,8 +16,8 @@ output:
     toc: true
     toc_depth: 3
 params:
-  stream:       "BigHole"
-  section:      "Melrose"
+  stream:       "Smith"
+  section:      "EagleCreek"
   data_dir:     "data/ModelFits/Brown Trout"      # single folder for CSVs + .rds model fits
   show_flow:    true                               # overlay lagged flow on abundance/survival plots
   min_inclusion_threshold: 0.10                    # cutoff used in appendix selection panels
@@ -169,9 +169,9 @@ if (has_global) {
   sims_winter <- sims_flow
 } else {
   mod_summer  <- load_rds(file.path(model_dir,
-                    paste0(SS, "_IndicatorVarSel_TopModSummer_Feb26.rds")))
-  mod_winter  <- load_rds(file.path(model_dir,
                     paste0(SS, "_IndicatorVarSel_TopModWinter_Feb26.rds")))
+  mod_winter  <- load_rds(file.path(model_dir,
+                    paste0(SS, "_IndicatorVarSel_TopModSummmer_Feb26.rds")))
   sims_summer <- get_sims(mod_summer)
   sims_winter <- get_sims(mod_winter)
   sims_flow   <- sims_summer   # use summer as the primary sims for shared params
