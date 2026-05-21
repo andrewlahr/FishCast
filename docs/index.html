@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Brown Trout IPM — Site Reports</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+  :root {
+    --brand: #2C5F8A;
+    --brand-light: #EBF5FB;
+    --text: #1A2533;
+    --muted: #5b6b7d;
+    --border: #d6dce3;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: var(--text);
+    background: #f6f8fa;
+  }
+  header {
+    background: var(--brand);
+    color: white;
+    padding: 18px 28px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 24px;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+  }
+  header h1 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+  header .subtitle {
+    font-size: 12px;
+    opacity: 0.85;
+    margin-top: 2px;
+  }
+  .picker {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-left: auto;
+  }
+  .picker label {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    opacity: 0.9;
+  }
+  select {
+    font-size: 14px;
+    padding: 7px 12px;
+    border-radius: 5px;
+    border: 1px solid rgba(255,255,255,0.3);
+    background: white;
+    color: var(--text);
+    min-width: 260px;
+    cursor: pointer;
+  }
+  main {
+    height: calc(100vh - 72px);
+    background: white;
+    border-top: 1px solid var(--border);
+  }
+  iframe {
+    width: 100%;
+    height: 100%;
+    border: none;
+    display: block;
+  }
+  .placeholder {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100%;
+    color: var(--muted);
+    font-size: 15px;
+    padding: 40px;
+    text-align: center;
+  }
+  .placeholder.error { color: #c0392b; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Brown Trout IPM — Site Reports</h1>
+    <div class="subtitle">Streamflow effects on recruitment, survival, and abundance</div>
+  </div>
+  <div class="picker">
+    <label for="site-select">Site:</label>
+    <select id="site-select">
+      <option value="">Loading sites…</option>
+    </select>
+  </div>
+</header>
+
+<main id="viewer">
+  <div class="placeholder">Select a site above to view its report.</div>
+</main>
+
+<script>
+(function() {
+  const sel    = document.getElementById('site-select');
+  const viewer = document.getElementById('viewer');
+
+  function showError(msg) {
+    viewer.innerHTML = '<div class="placeholder error">' + msg + '</div>';
+  }
+  function loadReport(file) {
+    if (!file) return;
+    viewer.innerHTML = '<iframe src="' + file + '" title="Site report"></iframe>';
+    // Keep URL in sync so reports are bookmarkable
+    const url = new URL(window.location.href);
+    url.searchParams.set('site', file);
+    window.history.replaceState({}, '', url);
+  }
+
+  fetch('sites.json')
+    .then(function(r) {
+      if (!r.ok) throw new Error('Could not load sites.json (HTTP ' + r.status + ')');
+      return r.json();
+    })
+    .then(function(sites) {
+      if (!Array.isArray(sites) || sites.length === 0) {
+        showError('No site reports found. Run render_all_sites.R to generate them.');
+        sel.innerHTML = '<option value="">(no sites)</option>';
+        return;
+      }
+
+      // Group by stream for a cleaner dropdown
+      const byStream = {};
+      sites.forEach(function(s) {
+        (byStream[s.stream] = byStream[s.stream] || []).push(s);
+      });
+
+      sel.innerHTML = '<option value="">— Select a site —</option>';
+      Object.keys(byStream).sort().forEach(function(stream) {
+        const grp = document.createElement('optgroup');
+        grp.label = stream + ' River';
+        byStream[stream].forEach(function(s) {
+          const opt = document.createElement('option');
+          opt.value = s.file;
+          opt.textContent = s.section;
+          grp.appendChild(opt);
+        });
+        sel.appendChild(grp);
+      });
+
+      // Respect ?site=... in URL, else default to first site
+      const params = new URLSearchParams(window.location.search);
+      const initial = params.get('site');
+      const match = initial && sites.find(function(s) { return s.file === initial; });
+      const pick  = match ? match.file : sites[0].file;
+      sel.value = pick;
+      loadReport(pick);
+    })
+    .catch(function(err) {
+      showError(err.message);
+    });
+
+  sel.addEventListener('change', function() {
+    loadReport(sel.value);
+  });
+})();
+</script>
+
+</body>
+</html>
