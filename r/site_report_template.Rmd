@@ -16,8 +16,8 @@ output:
     toc: true
     toc_depth: 3
 params:
-  stream:       "Smith"
-  section:      "EagleCreek"
+  stream:       "BigHole"
+  section:      "Melrose"
   data_dir:     "data/ModelFits/Brown Trout"      # single folder for CSVs + .rds model fits
   show_flow:    true                               # overlay lagged flow on abundance/survival plots
   min_inclusion_threshold: 0.10                    # cutoff used in appendix selection panels
@@ -163,21 +163,30 @@ get_sims <- function(mod) {
 # ── Load flow model(s) ────────────────────────────────────────────────────────
 if (has_global) {
   mod_flow    <- load_rds(file.path(model_dir,
-                    paste0(SS, "_IndicatorVarSel_TopMod_Feb26.rds")))
+                    paste0(SS, "_IndicatorVarSel_TopMod_Apr26_02.rds")))
   sims_flow   <- get_sims(mod_flow)
   sims_summer <- sims_flow   # same object used for both summer & winter params
   sims_winter <- sims_flow
 } else {
   mod_summer  <- load_rds(file.path(model_dir,
-                    paste0(SS, "_IndicatorVarSel_TopModWinter_Feb26.rds")))
+                    paste0(SS, "_IndicatorVarSel_TopModSummer_Apr26_02.rds")))
   mod_winter  <- load_rds(file.path(model_dir,
-                    paste0(SS, "_IndicatorVarSel_TopModSummmer_Feb26.rds")))
+                    paste0(SS, "_IndicatorVarSel_TopModWinter_Apr26_02.rds")))
   sims_summer <- get_sims(mod_summer)
   sims_winter <- get_sims(mod_winter)
   sims_flow   <- sims_summer   # use summer as the primary sims for shared params
 }
 
 # ── Load residual-variance model objects ─────────────────────────────────────
+if(SS=='Jefferson.Waterloo'){
+  resids_summer <- load_rds(file.path(model_dir,
+    paste0(SS, "_IndicatorVarSel_topModSummer_Apr26_02.rds")))
+  resids_winter <- load_rds(file.path(model_dir,
+    paste0(SS, "_IndicatorVarSel_topModWinter_Apr26_02.rds")))
+  resids_flow <- list(summer = resids_summer, winter = resids_winter)
+  resids_null <- load_rds(file.path(model_dir,
+  paste0(SS, "_IndicatorVarSel_NullMod_Apr26_02.rds")))
+}else{
 if (has_global) {
   resids_flow <- load_rds(file.path(model_dir,
     paste0(SS, "_IndicatorVarSel_TopMod_resids.rds")))
@@ -191,7 +200,7 @@ if (has_global) {
 
 resids_null <- load_rds(file.path(model_dir,
   paste0(SS, "_IndicatorVarSel_NullMod_resids.rds")))
-
+}
 sims_null <- get_sims(resids_null)
 
 # ── Load site flow CSV first (needed to derive start_year) ──────────────────
@@ -599,10 +608,10 @@ htmltools::HTML('
       <td style="padding:6px 10px; font-weight:bold; color:#1E8449;">Recruitment</td>
       <td style="padding:6px 10px; font-family:monospace;">
         log(R[t]) = log(&alpha;) + log(S[t]) &minus; &beta;&middot;SSB[t]
-        + b1r&middot;Flow<sub>sum</sub>[t&minus;k<sub>1</sub>]
-        + b12r&middot;Flow<sub>sum</sub>[t&minus;k<sub>1</sub>]<sup>2</sup>
-        + b5r&middot;Flow<sub>win</sub>[t&minus;k<sub>2</sub>]
-        + b52r&middot;Flow<sub>win</sub>[t&minus;k<sub>2</sub>]<sup>2</sup>
+        + &beta;<sub>1r</sub>&middot;Flow<sub>sum</sub>[t&minus;k<sub>1</sub>]
+        + &beta;<sub>12r</sub>&middot;Flow<sub>sum</sub>[t&minus;k<sub>1</sub>]<sup>2</sup>
+        + &beta;<sub>2r</sub>&middot;Flow<sub>win</sub>[t&minus;k<sub>2</sub>]
+        + &beta;<sub>22r</sub>&middot;Flow<sub>win</sub>[t&minus;k<sub>2</sub>]<sup>2</sup>
         &minus; &sigma;<sub>R</sub><sup>2</sup>/2
       </td>
       <td style="padding:6px 10px; color:#555;">
@@ -618,11 +627,11 @@ htmltools::HTML('
       <td style="padding:6px 10px; font-weight:bold; color:#A04000;">Survival</td>
       <td style="padding:6px 10px; font-family:monospace;">
         logit(Surv[t]) = lSurv0
-        + b1S&middot;Flow<sub>sum</sub>[t]
-        + b12S&middot;Flow<sub>sum</sub>[t]<sup>2</sup>
-        + b5S&middot;Flow<sub>win</sub>[t]
-        + b52S&middot;Flow<sub>win</sub>[t]<sup>2</sup>
-        &minus; b6S&middot;(N<sub>all</sub>[t&minus;1]/100)
+        + &beta;<sub>1S</sub>&middot;Flow<sub>sum</sub>[t]
+        + &beta;<sub>12S</sub>&middot;Flow<sub>sum</sub>[t]<sup>2</sup>
+        + &beta;<sub>2S</sub>&middot;Flow<sub>win</sub>[t]
+        + &beta;<sub>22S</sub>&middot;Flow<sub>win</sub>[t]<sup>2</sup>
+        &minus; &beta;<sub>D</sub>&middot;(N<sub>all</sub>[t&minus;1]/100)
       </td>
       <td style="padding:6px 10px; color:#555;">
         lSurv0 = intercept;<br>
@@ -767,7 +776,7 @@ if (!is.null(sims_summer$b1r)) {
   cat(sprintf(
 "## Summer Flow and Recruitment
 
-Summer mean flow at lag **%s** had a **%s** effect on log(Recruits/Spawners),
+Summer mean flow at lag **%s** had a **%s** effect on recruitment,
 modelled as a %s relationship (b1r = %s%s).\n\n",
     lag_phrase(eff_sum_lag),
     dir_b1r,
@@ -790,7 +799,7 @@ if (!is.null(sims_winter$b5r)) {
   cat(sprintf(
 "## Winter Flow and Recruitment
 
-Winter mean flow at lag **%s** had a **%s** effect on log(Recruits/Spawners),
+Winter mean flow at lag **%s** had a **%s** effect on recruitment,
 modelled as a %s relationship (b5r = %s%s).
 Effects on age-2 recruitment are not detectable in survey data until
 **%s**, reflecting the time from egg deposition to age-2 detection.\n\n",

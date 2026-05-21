@@ -148,5 +148,11 @@
     "section": "MillCreek",
     "label": "Yellowstone — MillCreek",
     "file": "Yellowstone_MillCreek.html"
+  },
+  {
+    "stream": "Jefferson",
+    "section": "Waterloo",
+    "label": "Jefferson — Waterloo",
+    "file": "Jefferson_Waterloo.html"
   }
 ]
